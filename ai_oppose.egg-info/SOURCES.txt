@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+setup.py
+ai_oppose/__init__.py
+ai_oppose/functions.py
+ai_oppose.egg-info/PKG-INFO
+ai_oppose.egg-info/SOURCES.txt
+ai_oppose.egg-info/dependency_links.txt
+ai_oppose.egg-info/requires.txt
+ai_oppose.egg-info/top_level.txt
+ai_oppose/data/egodepletion_literature.csv
