@@ -120,7 +120,7 @@ def generate_vectorstore(data: pd.DataFrame, max_doc_size = 4000) -> any:
                 print("Careful! You already seem to have files in your new_chroma_directory. You might create duplicates which affect search results.")
         docsearch = Chroma.from_documents(docs, embeddings, persist_directory=new_chroma_directory)
         docsearch.persist()
-        print(f"vectorstore has been generated: folder {new_chroma_directory}\n\nYou can comment out the data formatting and vectorstore generation steps if you would like to reuse the same literature.")
+        print(f"vectorstore has been generated: folder {new_chroma_directory}\n\n")
         return new_chroma_directory
 
 
@@ -255,5 +255,5 @@ def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summa
             file.write(f"""AI RESPONSE TO CLAIM:\n{insert_linebreaks(entry["response"], 140)}\n""")
             file.write(f"""SOURCE REF:\n{insert_linebreaks(entry["metadata"]["reference"], 200)}\n""")
             file.write(f"""SOURCE TEXT:\n{insert_linebreaks(entry["page_content"], 140)}\n\n\n""")
-    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim. An even briefer summary is the following:\n\n{summary_response}")
+    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim. One should work with the opposition file, but this is a very brief preview of some of the arguments:\n\n'{summary_response}'")
     return (responses, summary_response)

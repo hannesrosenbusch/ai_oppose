@@ -5,7 +5,7 @@ with open('README.md', 'r') as f:
 
 setup(
     name='ai_oppose',
-    version='0.0.1',
+    version='0.0.2',
     author='Hannes Rosenbusch',
     author_email='h.rosenbusch@uva.nl',
     description='generating adversarial takes on science claims with openai plus vectorstores',
