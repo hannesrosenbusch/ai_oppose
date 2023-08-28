@@ -1,8 +1,15 @@
+#cost estimation 
+#function to check and oppose abstracts, main claim
+#https://github.com/monk1337/resp for lit search
+
 import langchain
-from langchain.document_loaders import DataFrameLoader
+from langchain.document_loaders import DataFrameLoader, PyPDFLoader
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
 import os
 import shutil
 import openai
@@ -11,13 +18,41 @@ import time
 import tiktoken
 import unidecode
 
-def get_egodepletion_example_lit():
+
+
+def remove_punctuation(input_string):
+    paths = input_string.split("/")
+    if len(paths) > 0:
+        filename = paths[-1]
+    else:
+        filename = paths[0]
+    punctuation_chars = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~']
+    cleaned_string = ''.join(char for char in filename if char not in punctuation_chars)
+    return cleaned_string
+
+
+def get_example_literature_file(lit = "egodepletion"):
+    """
+    possible values for lit argument are egodepletion, humorXdating, powerpose
+    """
+    if lit.lower() == "egodepletion":
+        filename = "egodepletion_literature.csv"
+    elif lit.lower() == "humorxdating":
+        filename = "humorXdating_literature.csv"
+    elif lit.lower() == "powerpose":
+        filename = "powerpose_literature.csv"
+    else:
+        raise ValueError("lit argument should be one of 'egodepletion', 'humorXdating', 'powerpose'")
     data_directory = os.path.join(os.path.dirname(__file__), 'data')
-    source_path = os.path.join(data_directory, 'egodepletion_literature.csv')
-    destination_path = 'egodepletion_literature.csv'
+    source_path = os.path.join(data_directory, filename)
+    destination_path = filename
+    print(f"collected file -> {destination_path}")
     shutil.copy(source_path, destination_path)
 
 def insert_linebreaks(text: str, interval: int) -> str:
+    """
+    string manipulation helper (internal usage)
+    """
     lines = []
     current_line = ""
     for word in text.split():
@@ -45,33 +80,55 @@ def extract_last_names(text: str) -> str:
 
 
 def shorten(text: str, length: int) -> str:
+    """
+    string manipulation helper (internal usage)
+    """
     if len(text) > length:
         return text[0:length]
     return text
 
 
 def delete_duplicated_docs(mylist: list) -> list:
+    """
+    deletes langchain docs (internal usage)
+    """
     unique_els = []
     for el in mylist:
         if el[0] not in [e[0] for e in unique_els]:
             unique_els.append(el)
     return unique_els
 
+def delete_duplicated_elements(mylist: list) -> list:
+    """
+    deletes langchain docs (internal usage)
+    """
+    unique_els = []
+    for el in mylist:
+        if el not in unique_els:
+            unique_els.append(el)
+    return unique_els
+
 
 def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> str:
+    """
+    openai wrapper (internal usage)
+    """
     retries = 0
     max_retries = 5
     backoff_time = 5  # Initial backoff time in seconds
     while retries < max_retries:
         try:
+            print("trying")
             response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[{"role": "system", "content": system_message},
                           {"role": "user", "content": prompt}],
                 temperature=temperature,
             )
+            print("done")
             return response["choices"][0]["message"]["content"].strip()
-        except:
+        except Exception as e:
+            print(e)
             print(f"potential openai api issue (overload etc). trying again...({retries}/{max_retries})")
             time.sleep(backoff_time)
             backoff_time *= 2  # Exponential backoff
@@ -79,55 +136,120 @@ def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> 
     return f"API Error {prompt}"
 
 
+
+
+
+
+
+
+def references_string_as_list(input_string):
+    if not ("[" in input_string and "]" in input_string):
+        print("no brackets found in extracted references")
+        return []
+    first_bracket_index = input_string.find('[')
+    last_bracket_index = input_string.rfind(']')
+    result_string = input_string[first_bracket_index:1+last_bracket_index]
+    try:
+        evaluated_list = list(eval(result_string))
+        return evaluated_list
+    except:
+        print(f"Error: Could not evaluate the string as a list: {input_string} trimmed: {result_string}.")
+        return []
+
+
+def extract_pdf_references(filepath: str) -> any:
+    loader = PyPDFLoader(filepath)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3500, chunk_overlap=200)
+    docs = loader.load_and_split(text_splitter=text_splitter)
+    responses = []
+    system_prompt = "You are an AI tool that extracts reference lists from papers."
+    no_hits = 0
+    for doc in reversed(docs):
+        prompt = f"List all full-length references in the following paper section. Ignore short in-text references like '(Miller, 1998)'. Only extract references as shown in final bibliography lists which include titles and journals. Respond with square brackets ['fullsource1', 'fullsource2', 'fullsource3'...]. Return empty list if there were there was no bibliography in the text or if there were only short in-text references. TEXT: {doc.page_content}"
+        response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
+        ref_list = references_string_as_list(response)
+        if len(ref_list) == 0:
+            no_hits += 1
+            if no_hits == 2:
+                break
+        else:
+            no_hits = 0
+        responses.extend(ref_list)
+        # print(f"total refs: {len(responses)}, new refs: {len(ref_list)}")
+    responses.sort()
+    return delete_duplicated_elements(responses)
+
+
+
+
+
+
+
+
+
 def format_texts_from_csv(file_path: str, abstract_column: str, author_column: str, title_column: str, year_column: str) -> pd.DataFrame:
     """
-    columns expected in csv (zotero default):
+    columns expected in csv (with default zotero names):
     "Abstract Note": abstract of the paper
     "Publication Year": year of the publication
     "Author": assumes last names are followed by comma
     "Title": title of paper
     """
-    now = time.ctime().replace(":", "").replace(" ", "")[0:-4]
-    data = pd.read_csv(file_path)
-    for col in [abstract_column, author_column, title_column, year_column]:
+    try:
+        data = pd.read_csv(file_path, encoding='utf-8')
+    except:
+        data = pd.read_csv(file_path, encoding='latin1')
+    chosen_cols = [abstract_column, author_column, title_column, year_column]
+    if not all([col in data.columns for col in chosen_cols]):
+        raise ValueError(f"make sure that your csv has the chosen column headers: {chosen_cols}")
+    
+    indices = data[data[abstract_column].isna() | data[abstract_column].eq('')].index
+    if len(indices > 0):
+        print(f'careful there are empty cells in column "{abstract_column}" resulting in empty literature entries.\nROWS: {indices}')
+    
+    for col in chosen_cols:
         data[col] = data[col].astype(str)
     data[author_column] = data[author_column].apply(extract_last_names)
-    data["file_content"] = "TITLE: " + data[title_column] + " ABSTRACT: " + data[abstract_column] + " SOURCE: " + "("  + data[author_column]  + " " + data[year_column].astype(str) + ")"
+    data["file_content"] = "TITLE: '" + data[title_column] + "' ABSTRACT: '" + data[abstract_column] + "' SOURCE: " + "("  + data[author_column]  + " " + data[year_column].astype(str) + ")"
     data["reference"] = [shorten(author, 80) + " "  + str(yea) for author, yea in zip(data[author_column], data[year_column].astype(str) )]
     data["reference"] = data["reference"].apply(unidecode.unidecode)
     data["file_content"] = data["file_content"].apply(unidecode.unidecode)
     return data
 
 
-def generate_vectorstore(data: pd.DataFrame, max_doc_size = 4000) -> any:
+def generate_vectorstore(data: pd.DataFrame, filepath: str, max_doc_size = 4000) -> any:
+    """generates a folder that should not be deleted as it will be used for the claim oppositions later. 
+    it costs money to use this function as it is run with openai embedding model"""
     booleans = ["vectorstore_" in f for f in os.listdir()]
     if any(booleans):
         existing_vectorstore = [f for f, b in zip(os.listdir(),booleans) if b][0]
         userinput = input(f"Would you like to work with {existing_vectorstore} instead of generating a new vectorstore? (y/n)")
         if "y" in userinput.lower():
             return existing_vectorstore
-    else:
-        new_chroma_directory = f'vectorstore_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}'
-        embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
-        loader = DataFrameLoader(data[["file_content","reference"]], page_content_column = "file_content")
-        documents = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=max_doc_size, chunk_overlap=0)
-        docs = text_splitter.split_documents(documents)
-        if len(data) != len(data):
-                print(f"Careful! {len(data)} files were saved as {len(docs)} documents in the vector store.")
-        if os.path.exists(new_chroma_directory) and os.path.isdir(new_chroma_directory):
-            if len(os.listdir(new_chroma_directory)) > 0:
-                print("Careful! You already seem to have files in your new_chroma_directory. You might create duplicates which affect search results.")
-        docsearch = Chroma.from_documents(docs, embeddings, persist_directory=new_chroma_directory)
-        docsearch.persist()
-        print(f"vectorstore has been generated: folder {new_chroma_directory}\n\n")
-        return new_chroma_directory
+    print(filepath)
+    filepath = shorten(remove_punctuation(filepath).replace(".csv", ""), 40)
+    print(filepath)
+    new_chroma_directory = f'vectorstore_{filepath}_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}'
+    embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
+    loader = DataFrameLoader(data[["file_content","reference"]], page_content_column = "file_content")
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=max_doc_size, chunk_overlap=0)
+    docs = text_splitter.split_documents(documents)
+    if len(data) != len(data):
+            print(f"Careful! {len(data)} files were saved as {len(docs)} documents in the vector store.")
+    if os.path.exists(new_chroma_directory) and os.path.isdir(new_chroma_directory):
+        if len(os.listdir(new_chroma_directory)) > 0:
+            print("Careful! You already seem to have files in your new_chroma_directory. You might create duplicates which affect search results.")
+    docsearch = Chroma.from_documents(docs, embeddings, persist_directory=new_chroma_directory)
+    docsearch.persist()
+    print(f"vectorstore has been generated: folder {new_chroma_directory}\n\n")
+    return new_chroma_directory
 
 
 
 def filter_docs(presented_claim: str, relevant_docs: list) -> list:
     """
-    This function checks whether the docs returned from the literature search are truly relevant.
+    This function checks whether the docs returned from the literature search are truly relevant. (internal usage)
     """
     openai.api_key = os.environ['OPENAI_API_KEY']
     filtered_docs = []
@@ -150,6 +272,10 @@ def filter_docs(presented_claim: str, relevant_docs: list) -> list:
 
 
 def get_relevant_docs(presented_claim: str, chroma_directory: str, max_documents = 8, search_width = 2) -> any:
+    """
+    conducts various similarity searches between the given claim and the literature in the vectorstore.
+    returns relevant langchain documents.
+    """
     openai.api_key = os.environ['OPENAI_API_KEY']
     embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
 
@@ -194,15 +320,17 @@ def get_relevant_docs(presented_claim: str, chroma_directory: str, max_documents
             relevant_docs = relevant_docs[0:max_documents]
     relevant_docs = [doc[0] for doc in relevant_docs]
     if len(relevant_docs) == 0:
-        raise ValueError("No relevant documents found in AI vectorstore.")
+        print(f"\nNo relevant documents found in your literature corpus '{chroma_directory}'! Try adding papers.\n")
+        for doc in relevant_docs:
+            doc.page_content = "No documents were relevant for the claim. No comment can be generated."
+            doc.metadata = ""
     return relevant_docs
 
 
 
 def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summarize_results = True, ) -> tuple:
     """
-    REQUIRED
-    This function produces the adversarial claims.
+    This function produces the adversarial claims through gpt-4 and under reference of the relevant documents.
     """
     openai.api_key = os.environ['OPENAI_API_KEY']
 
@@ -255,5 +383,5 @@ def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summa
             file.write(f"""AI RESPONSE TO CLAIM:\n{insert_linebreaks(entry["response"], 140)}\n""")
             file.write(f"""SOURCE REF:\n{insert_linebreaks(entry["metadata"]["reference"], 200)}\n""")
             file.write(f"""SOURCE TEXT:\n{insert_linebreaks(entry["page_content"], 140)}\n\n\n""")
-    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim. One should work with the opposition file, but this is a very brief preview of some of the arguments:\n\n'{summary_response}'")
+    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim.")
     return (responses, summary_response)
