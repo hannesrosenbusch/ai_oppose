@@ -20,14 +20,16 @@ import unidecode
 
 
 
-def remove_punctuation(input_string):
+def remove_punctuation(input_string, remove_single_letters = False):
     paths = input_string.split("/")
     if len(paths) > 0:
         filename = paths[-1]
     else:
         filename = paths[0]
-    punctuation_chars = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~']
+    punctuation_chars = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '–', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~']
     cleaned_string = ''.join(char for char in filename if char not in punctuation_chars)
+    if remove_single_letters:
+        cleaned_string = ' '.join([word for word in cleaned_string.split() if len(word) > 1])
     return cleaned_string
 
 
@@ -161,22 +163,35 @@ def extract_pdf_references(filepath: str) -> any:
     loader = PyPDFLoader(filepath)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=3500, chunk_overlap=200)
     docs = loader.load_and_split(text_splitter=text_splitter)
+    if len(docs) == 0:
+        print("no readable text found in pdf")
+        return []
     responses = []
     system_prompt = "You are an AI tool that extracts reference lists from papers."
     no_hits = 0
+    found_refs = False
     for doc in reversed(docs):
-        prompt = f"List all full-length references in the following paper section. Ignore short in-text references like '(Miller, 1998)'. Only extract references as shown in final bibliography lists which include titles and journals. Respond with square brackets ['fullsource1', 'fullsource2', 'fullsource3'...]. Return empty list if there were there was no bibliography in the text or if there were only short in-text references. TEXT: {doc.page_content}"
+        prompt = f"Extract author names, paper titles, and years from the following bibliography. Respond in this list format: [{{'year': '1992', 'authors': 'E. Wiltens, A. Stone', 'title': 'effects of mdma'}}, {{'year': '2022', 'authors': 'S. Wiesen', 'title': 'durability of iron in water'}}]. Exclude journal names. Return an empty list [] if there was no bibliography or only short in-text references without paper titles. TEXT: {doc.page_content}"
         response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
+        print(response)
         ref_list = references_string_as_list(response)
-        if len(ref_list) == 0:
-            no_hits += 1
-            if no_hits == 2:
-                break
+        if len(ref_list) > 0:
+            found_refs = True
         else:
-            no_hits = 0
+            if found_refs: #if there were refs found previously then we might have gone up to the beginning of the bibliography
+                no_hits += 1
+                if no_hits == 2:
+                    break
+            continue
+        print(no_hits)
         responses.extend(ref_list)
         # print(f"total refs: {len(responses)}, new refs: {len(ref_list)}")
-    responses.sort()
+    print(no_hits)
+    try:
+        ref_list = [ref for ref in ref_list if ref["title"] != ""]
+        ref_list.sort(key= lambda x: x["authors"])
+    except:
+        print("likely the LLM misformatted the pdf references")
     return delete_duplicated_elements(responses)
 
 

@@ -1,0 +1,5 @@
+Session: 29/8/2023
+Time: 10:28:35
+[INFO]10:28:35 Built LOG folder for session
+[INFO]10:29:24 https://link.springer.com/search/page/ start_url has been received
+[INFO]10:29:24 https://link.springer.com/search/page/0?facet-content-type="Article"&query=humor+audience+jokes+importance&facet-language="En" has been obtained
