@@ -18,18 +18,114 @@ import time
 import tiktoken
 import unidecode
 
+import litstudy
+import numpy as np
+from fuzzywuzzy import fuzz
 
 
-def remove_punctuation(input_string, remove_single_letters = False):
-    paths = input_string.split("/")
-    if len(paths) > 0:
-        filename = paths[-1]
-    else:
-        filename = paths[0]
+def litsearch(q: str) -> any:
+    q = clean_string(q)
+    try:
+        docs = litstudy.search_semanticscholar(q, limit = 5, batch_size=5)
+    except:
+        try:
+            q_words = q.split(" ")
+            q_shortened = " ".join(q_words[0:int(len(q_words)/2)])
+            docs = litstudy.search_semanticscholar(q_shortened, limit = 5, batch_size=5)
+        except:
+            try:
+                docs = litstudy.search_crossref(q, limit = 5)
+            except:
+                print(f"search fail for semantic scholar and crossref: {q}")
+                docs = []
+
+    docs = [doc for doc in docs]
+    return docs
+
+
+def find_metadata_for_ref(ref: dict) -> dict:
+    finds = []
+    docs = litsearch(ref["Title"])
+    for doc in docs:
+        if doc.authors is None or doc.publication_year is None or doc.title is None:
+            print("\nskipping incomplete search result\n")
+            continue
+        # print(f"""{ref["Publication Year"]} ||| {shorten(ref["Author"], 15)} ||| {shorten(ref["Title"].lower(), 15)}""")
+        # print(f"""{doc.publication_year} ||| {shorten(' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), 15)} ||| {shorten(doc.title.lower(), 10)}""")
+
+        #title
+        title_orig = clean_string(ref["Title"].lower(), min_word_length=2)
+        title_search = clean_string(doc.title.lower(), min_word_length=2)
+        titles_match = fuzz.WRatio(title_orig, title_search) > 85
+        # print(f"titles: {fuzz.WRatio(title_orig, title_search)}/85")
+
+        #authors
+        authors_orig = clean_string(ref["Author"].lower(), min_word_length=2)
+        authors_search = clean_string(' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), min_word_length=2)
+        authors_match = fuzz.WRatio(authors_orig, authors_search) > 70
+        # print(f"authors: {fuzz.WRatio(authors_orig, authors_search)}/70")
+        
+        #year
+        year_match = np.abs(int(doc.publication_year) - int(ref["Publication Year"])) <= 1
+        # print(f"""year difference {np.abs(int(doc.publication_year) - int(ref["Publication Year"]))}""")
+
+        #match
+        # print(f"{year_match}, {authors_match}, {titles_match}")
+        if year_match and authors_match and titles_match:
+            ref = {"Author": ' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), "Title": doc.title, "Publication Year": doc.publication_year, "Abstract Note": doc.abstract, "References": [], "Citations": []}
+            if doc.references:
+                ref["References"] =  [d for d in doc.references]
+            if doc.citations:
+                ref["Citations"] = [d for d in doc.citations]
+            return find_dict
+                
+    #no match
+    ref["Abstract Note"] = ""
+    ref["References"] = []
+    ref["Citations"] = []
+    return ref
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def clean_string(input_string, min_word_length = 0, filepath = False):
+    if filepath:
+        paths = input_string.split("/")
+        if len(paths) > 0:
+            input_string = paths[-1]
+        else:
+            input_string = paths[0]
     punctuation_chars = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '–', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~']
-    cleaned_string = ''.join(char for char in filename if char not in punctuation_chars)
-    if remove_single_letters:
-        cleaned_string = ' '.join([word for word in cleaned_string.split() if len(word) > 1])
+    cleaned_string = ''.join(char if char not in punctuation_chars else " " for char in input_string)
+    cleaned_string = ' '.join([word for word in cleaned_string.split() if len(word) >= min_word_length])
     return cleaned_string
 
 
@@ -110,6 +206,13 @@ def delete_duplicated_elements(mylist: list) -> list:
             unique_els.append(el)
     return unique_els
 
+def rename_dict_keys(input_dict, key_mapping):
+    new_dict = {}
+    for old_key, new_key in key_mapping.items():
+        if old_key in input_dict:
+            new_dict[new_key] = input_dict[old_key]
+    return new_dict
+
 
 def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> str:
     """
@@ -120,14 +223,12 @@ def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> 
     backoff_time = 5  # Initial backoff time in seconds
     while retries < max_retries:
         try:
-            print("trying")
             response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[{"role": "system", "content": system_message},
                           {"role": "user", "content": prompt}],
                 temperature=temperature,
             )
-            print("done")
             return response["choices"][0]["message"]["content"].strip()
         except Exception as e:
             print(e)
@@ -173,7 +274,6 @@ def extract_pdf_references(filepath: str) -> any:
     for doc in reversed(docs):
         prompt = f"Extract author names, paper titles, and years from the following bibliography. Respond in this list format: [{{'year': '1992', 'authors': 'E. Wiltens, A. Stone', 'title': 'effects of mdma'}}, {{'year': '2022', 'authors': 'S. Wiesen', 'title': 'durability of iron in water'}}]. Exclude journal names. Return an empty list [] if there was no bibliography or only short in-text references without paper titles. TEXT: {doc.page_content}"
         response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
-        print(response)
         ref_list = references_string_as_list(response)
         if len(ref_list) > 0:
             found_refs = True
@@ -183,13 +283,13 @@ def extract_pdf_references(filepath: str) -> any:
                 if no_hits == 2:
                     break
             continue
-        print(no_hits)
         responses.extend(ref_list)
         # print(f"total refs: {len(responses)}, new refs: {len(ref_list)}")
-    print(no_hits)
     try:
-        ref_list = [ref for ref in ref_list if ref["title"] != ""]
-        ref_list.sort(key= lambda x: x["authors"])
+        responses = [ref for ref in responses if ref["title"] != "" and ref["authors"] != ""]
+        responses.sort(key= lambda x: clean_string(x["authors"], min_word_length=2))
+        new_key_names = {"title": "Title", "year": "Publication Year", "authors": "Author"}
+        responses = [rename_dict_keys(ref, new_key_names) for ref in responses]
     except:
         print("likely the LLM misformatted the pdf references")
     return delete_duplicated_elements(responses)
@@ -242,7 +342,7 @@ def generate_vectorstore(data: pd.DataFrame, filepath: str, max_doc_size = 4000)
         if "y" in userinput.lower():
             return existing_vectorstore
     print(filepath)
-    filepath = shorten(remove_punctuation(filepath).replace(".csv", ""), 40)
+    filepath = shorten(clean_string(filepath, remove_single_letters=False, filepath=True).replace("csv", ""), 40)
     print(filepath)
     new_chroma_directory = f'vectorstore_{filepath}_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}'
     embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
