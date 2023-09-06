@@ -1,3 +1,7 @@
 dist
-test.ipynb
+test
 *.pdf
+trash
+*.bak
+*.dat
+*.dir
