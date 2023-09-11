@@ -1,5 +1,4 @@
 #cost estimation 
-
 import langchain
 from langchain.document_loaders import DataFrameLoader, PyPDFLoader
 from langchain.embeddings import OpenAIEmbeddings
@@ -11,6 +10,7 @@ import os
 import shutil
 import requests
 import time
+import re
 
 import numpy as np
 import pandas as pd
@@ -31,7 +31,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 
 
-def autosearch_missing_abstracts(file_path: str, outpath: str, bias = ["pubmed", "researchgate"]):
+def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
     """"
     this function replaces short (<50) and missing abstracts from the provided csv through calls to google scholar google.
     for proper scientific work, abstracts should be gathered manually rather than with this function, because blind reliance on google might result in false matches between papers and abstract.
@@ -41,30 +41,42 @@ def autosearch_missing_abstracts(file_path: str, outpath: str, bias = ["pubmed",
         df = pd.read_csv(file_path, encoding='utf-8')
     except:
         df = pd.read_csv(file_path, encoding='latin1')
+    mask = (df["Abstract Note"].str.len() < 50) | (df["Abstract Note"].isna())
+    print(f"""{mask.sum()} abstracts missing out of {len(df)}""")
     use_google = False
     for i in range(len(df)):
-        print(f"""\n{shorten(df.loc[i, "Author"], 20)}: {shorten(df.loc[i, "Title"], 20)}""")
+        print(f"""\n{shorten(df.loc[i, "Author"], 25)}: {shorten(df.loc[i, "Title"], 30)}""")
         if len(str(df.loc[i, "Abstract Note"])) < 50 or pd.isna(df.loc[i, "Abstract Note"]):
             if not use_google:
                 try:
                     new_ref = get_abstract_from_scholar(dict(df.loc[i,:]))
+                    if new_ref["Abstract Note"] == "":
+                        print("failed to get abstract from scholar-based url. trying google")
+                        new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = ["pubmed", "springer"])
                 except Exception as e:
                     print(e)
                     use_google = True
             if use_google:
                 print("AI OPPOSE MESSAGE: hit google scholar rate limit; using google")
-                new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = bias)
-            print(f"""abstract length from {len(str(df.loc[i, "Abstract Note"]))} to {len(new_ref["Abstract Note"])}""")
+                new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = ["pubmed", "springer"])
+                if new_ref["Abstract Note"] == "":
+                    print("try raw google")
+                    new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = [])
+            print(new_ref["SOURCE"])
+            print(f"""length new abstract: {len(new_ref["Abstract Note"])}""")
             df.loc[i, "Abstract Note"] = new_ref["Abstract Note"]
             df.loc[i, "SOURCE"] = new_ref["SOURCE"]
-    if outpath:
-        df.to_csv(outpath)
-    return df
+            if outpath:
+                sort_according_to_abstract_len(df).to_csv(outpath, index = False)
+    mask = (df["Abstract Note"].str.len() < 50) | (df["Abstract Note"].isna())
+    print(f"DONT USE EXCEL FOR ADDING {mask.sum()} MISSING ABSTRACTS! USE FUNCTION >>> manual_entry_abstracts(infile = 'mylit.csv', outfile = 'mylit.csv')")
+    print(f'AFTER COMBINING MULTIPLE LITERATURE_DFs (e.g., pandas.merge/concatenate) YOU MIGHT USE >>> ai_oppose.remove_duplicate_rows(df: pd.DataFrame, similarity_threshold=90)')
+    return sort_according_to_abstract_len(df)
 
 
-def clean_string(input_string, min_word_length = 0, filepath = False):
+def clean_string(input_string: str, min_word_length = 0, filepath = False, remove_numbers = False) -> str:
     """
-    docstring pending
+    cut punctuation. optionally remove numbers, short words, or everything before last '/' in case of filepath
     """
     if filepath:
         paths = input_string.split("/")
@@ -75,6 +87,8 @@ def clean_string(input_string, min_word_length = 0, filepath = False):
     punctuation_chars = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '–', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~']
     cleaned_string = ''.join(char if char not in punctuation_chars else " " for char in input_string)
     cleaned_string = ' '.join([word for word in cleaned_string.split() if len(word) >= min_word_length])
+    if remove_numbers:
+        cleaned_string = re.sub(r'\d', '', cleaned_string)
     return cleaned_string
 
 
@@ -99,26 +113,467 @@ def delete_duplicated_docs(mylist: list) -> list:
             unique_els.append(el)
     return unique_els
 
+    
+def extract_abstract(url: str, title: str, authors: str) -> str:
+    """
+    takes url, paper title, and author name string
+    goes to url
+    checks for match
+    returns abstract or empty string
+    """
+    title_mismatch = True
+    author_mismatch = True
+    try:
+        chrome_options = Options()
+        driver = webdriver.Chrome(options=chrome_options)
+        if url.endswith(".pdf") or url.endswith(".PDF"):
+            #     page_text = get_pdf_url_text(url)
+            page_text = ""
+        elif "pubmed.ncbi" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                page_text = driver.find_element(By.ID, 'eng-abstract').text
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'heading-title').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                author_divs = driver.find_elements(By.CLASS_NAME,"authors-list-item")
+                authors_found = " ".join([clean_string(a.text, remove_numbers=True, min_word_length=2) for a in author_divs])
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                page_text = ""
+        elif "link.springer" in url or "www.nature" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                parent_div = driver.find_element(By.CLASS_NAME, 'c-article-body')
+                page_text = parent_div.find_element(By.CSS_SELECTOR, "section[data-title='Abstract']").text
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'c-article-title').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                author_divs = driver.find_elements(By.CLASS_NAME,"c-article-author-list__item")
+                authors_found = " ".join([clean_string(a.text, min_word_length=2) for a in author_divs])
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                page_text = ""
+        elif "researchgate" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                page_text = driver.find_element(By.ID, 'eng-abstract').text
+                abstract_divs = driver.find_elements(By.CSS_SELECTOR, '[class*="abstract"]')
+                page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
+                title_found = clean_string(driver.find_element(By.CSS_SELECTOR, '[class*="__title"]').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                author_divs = driver.find_elements(By.CLASS_NAME,"publication-header-author")
+                authors_found = [d.find_element(By.CSS_SELECTOR, '[class*="__title"]').text for d in author_divs]
+                authors_found = " ".join([clean_string(a, min_word_length=2) for a in authors_found])
+                authors_mismatch = fuzz.WRatio(authors, authors_found) < 70
+                driver.quit()
+            except Exception as e:
+                page_text = ""
+        elif "sciencedirect" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                abstract_divs = driver.find_elements(By.CSS_SELECTOR, '[class*="abstract"]')
+                page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 60][0]
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'title-text').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                authors_found = driver.find_element(By.CLASS_NAME,"author-group").text.replace("Author links open overlay panel", "")
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                page_text = ""
+        elif "psycnet" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                page_text =  driver.find_element(By.TAG_NAME, 'abstract').text
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'm-t-0').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                authorsdivs = driver.find_elements(By.CLASS_NAME,"linked-author")
+                authors_found = " ".join([a.text for a in authorsdivs])
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                print(e)
+                page_text = ""
+        elif "www.ncbi." in url:
+            try:
+                print(url)
+                driver.get(url)
+                driver.implicitly_wait(10)
+                try:
+                    page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
+                except:
+                    page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Summary')]/following-sibling::*[1]").text
+                print(page_text)
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'content-title').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                preceding_element = driver.find_element(By.CLASS_NAME, 'content-title')
+                following_div = preceding_element.find_element(By.XPATH, "following-sibling::div")
+                authors_found = following_div.text
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                print(e)
+                page_text = ""
+        else:
+            # try:
+            #     try:
+            #         abstract_divs = driver.find_elements(By.CSS_SELECTOR, '[class*="abstract"]')
+            #         page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
+            #     except:
+            #         abstract_divs = driver.find_element(By.CSS_SELECTOR, '[id*="abstract"]')
+            #         page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
+            # except:
+            #     try:
+            #         page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
+            #     except:
+            page_text = ""
+        if title_mismatch or authors_mismatch:
+            page_text = ""
+        if page_text.lower().startswith("abstract\n"):
+            page_text = page_text[len("abstract\n"):]
+    except Exception as e:
+        print(e)
+        page_text = ""
+    return page_text.replace("\n", " ")
 
-def get_abstract_from_google(ref, bias = ["pubmed", "researchgate"]):
+
+def extract_claim_per_paragraph(pdffile: str, max_paragraphs = 5) -> list:
+    sections = []
+    loader = PyPDFLoader(pdffile)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200, separators=["\n"])
+    docs = loader.load_and_split(text_splitter=text_splitter)
+    if len(docs) == 0:
+        print("no readable text found in pdf")
+        return []
+    limit = np.min([max_paragraphs - 1, len(docs) - 1])
+    for doc in docs[0:limit]:
+        prompt = f"Extract the central claim from the following paragraph. Reproduce the claim within one sentence (Example responses: 'A low sodium diet reduces the risk of heart disease.', 'The attention mechanism was not pioneered in transformer architectures.'). If there is no claim, just say: ''. Paper snippet: <<<{doc.page_content}>>>"
+        system_prompt = "You are an AI model that extracts claims from text paragraphs. You state the claim in a concise sentence (Example response: 'Bananas are yellow')."
+        response = perform_chat_completion(prompt=prompt, system_message=system_prompt, temperature=0)
+        section = {"claim": response, "page_content": doc.page_content}
+        sections.append(section)
+    print(len(docs))
+    return sections
+
+
+def extract_focal_claims(pdf_path: str, max_claims = 3) -> list:
+    """"
+    takes a pdf and returns {max_claims} novel claims made in the paper.
     """
-    docstring pending
+    loader = PyPDFLoader(pdf_path)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3800, chunk_overlap=200)
+    docs = loader.load_and_split(text_splitter=text_splitter)
+    claims = []
+    nr_claims = 0
+    for i, doc in enumerate(docs):
+        if nr_claims >= max_claims:
+            break
+        prompt = f"Extract the novel claim from the following research paper snippet. Only give the claim that is novel and unique to the publication. Ignore claims from previous references mentioned in the paper. Simply reproduce the novel claim within one sentence (Example responses: 'A low sodium diet reduces the risk of heart disease.', 'The attention mechanism was not pioneered in transformer architectures.'). If there is no novel claim, just say: ''. Paper snippet: <<<{doc.page_content}>>>"
+        system_prompt = "You are an AI model that extracts the central claim from research papers. You state the claim in a single sentence as if you were the original author."
+        response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
+        if response != "" and response != "''":
+            claims.append(response)
+            nr_claims += 1
+    return claims
+
+
+def extract_last_names(text: str) -> str:
+    """extracts last names by assuming they are followed by a comma"""
+    if "," in text:
+        words = text.split(" ")
+        text = " ".join(name for name in words if name[-1] == ",")
+    return clean_string(text, min_word_length=2)
+
+    
+
+def extract_pdf_references(filepath: str) -> list:
     """
+    takes pdf filepath to a research paper and uses gpt to extract list of references
+    """
+    loader = PyPDFLoader(filepath)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3500, chunk_overlap=200)
+    docs = loader.load_and_split(text_splitter=text_splitter)
+    if len(docs) == 0:
+        print("no readable text found in pdf")
+        return []
+    responses = []
+    system_prompt = "You are an AI tool that extracts reference lists from papers."
+    no_hits = 0
+    found_refs = False
+    for doc in reversed(docs):
+        prompt = f"Extract author names, paper titles, and years from the following bibliography. Respond in this list format: [{{'year': '1992', 'authors': 'E. Wiltens, A. Stone', 'title': 'effects of mdma'}}, {{'year': '2022', 'authors': 'S. Wiesen', 'title': 'durability of iron in water'}}]. Exclude journal names. Return an empty list [] if there was no bibliography or only short in-text references without paper titles. TEXT: {doc.page_content}"
+        response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
+        ref_list = references_string_as_list(response)
+        if len(ref_list) > 0:
+            found_refs = True
+        else:
+            if found_refs: #if there were refs found previously then we might have gone up to the beginning of the bibliography
+                no_hits += 1
+                if no_hits == 2:
+                    break
+            continue
+        responses.extend(ref_list)
+    try:
+        responses = [ref for ref in responses if ref["title"] != "" and ref["authors"] != ""]
+        responses.sort(key= lambda x: clean_string(x["authors"], min_word_length=2))
+        new_key_names = {"title": "Title", "year": "Publication Year", "authors": "Author"}
+        responses = [rename_dict_keys(ref, new_key_names) for ref in responses]
+    except:
+        print("likely the LLM misformatted the pdf references")
+    return delete_duplicated_elements(responses)
+
+
+def find_metadata_for_ref(ref: dict) -> dict:
+    """
+    takes in a ref dictionary with Title, Publication Year, and Author
+    searches for that ref with litstudy
+    if match found, it adds Abstract, References, and Citations to the ref dictionary
+    """
+    docs = litsearch(ref["Title"])
+    for doc in docs:
+        if doc.authors in [None,'N/A'] or doc.publication_year in [None,'N/A'] or doc.title in [None,'N/A']:
+            print("||||||incomplete results")
+            continue
+        title_orig = clean_string(ref["Title"].lower(), min_word_length=2)
+        title_search = clean_string(doc.title.lower(), min_word_length=2)
+        titles_match = fuzz.WRatio(title_orig, title_search) > 85
+        authors_orig = clean_string(ref["Author"].lower(), min_word_length=2)
+        authors_search = clean_string(' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), min_word_length=2)
+        authors_match = fuzz.WRatio(authors_orig, authors_search) > 70
+        if is_integer(ref["Publication Year"]):
+            year_match = np.abs(int(doc.publication_year) - int(ref["Publication Year"])) <= 1
+        else: 
+            year_match = False
+        if year_match and authors_match and titles_match:
+            ref = {"Author": ', '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))])+',', "Title": doc.title, "Publication Year": doc.publication_year, "Abstract Note": doc.abstract, "References": [], "Citations": []}
+            if doc.references:
+                ref["References"] =  [d for d in doc.references]
+            if doc.citations:
+                ref["Citations"] = [d for d in doc.citations]
+            return ref
+    #no match
+    ref["Abstract Note"] = ""
+    ref["References"] = []
+    ref["Citations"] = []
+    return ref
+
+
+def filter_docs(presented_claim: str, relevant_docs: list) -> list:
+    """
+    This function checks whether the docs returned from the literature search are truly relevant. (internal usage)
+    """
+    openai.api_key = os.environ['OPENAI_API_KEY']
+    filtered_docs = []
+    for doc, score in relevant_docs:
+        filterprompt = f"""
+        Presented claim:
+        {presented_claim}
+
+        Target paper:
+        {doc.page_content}
+
+        Instructions:
+        Classify whether the Target Paper is relevant to the Presented Claim. Answer "yes" or "no". If unsure, answer "no".
+        """
+        filterresponse = perform_chat_completion(filterprompt, system_message="You are an attentive academic machine that only says 'yes' or 'no'.", temperature=0)
+        if "yes" in filterresponse.lower():
+            filtered_docs.append((doc, score))
+    return filtered_docs
+
+
+def format_texts_from_csv(file_path: str, abstract_column: str, author_column: str, title_column: str, year_column: str) -> pd.DataFrame:
+    """
+    columns expected in csv (with default zotero names):
+    "Abstract Note": abstract of the paper
+    "Publication Year": year of the publication
+    "Author": assumes last names are followed by comma
+    "Title": title of paper
+    """
+    try:
+        data = pd.read_csv(file_path, encoding='utf-8', keep_default_na=False)
+    except:
+        data = pd.read_csv(file_path, encoding='latin1', keep_default_na=False)
+    chosen_cols = [abstract_column, author_column, title_column, year_column]
+    if not all([col in data.columns for col in chosen_cols]):
+        raise ValueError(f"make sure that your csv has the chosen column headers: {chosen_cols}")
+    data = data[data[abstract_column] != '']
+    indices = data[data[abstract_column].isna() | data[abstract_column].eq('')].index
+    if len(indices > 0):
+        print(f'careful there are empty cells in column "{abstract_column}" resulting in empty literature entries.\nROWS: {indices}')
+    for col in chosen_cols:
+        data[col] = data[col].astype(str)
+    data[author_column] = data[author_column].apply(extract_last_names)
+    data["file_content"] = "TITLE: '" + data[title_column] + "' ABSTRACT: '" + data[abstract_column] + "' SOURCE: " + "("  + data[author_column]  + ", " + data[year_column].astype(str) + ")"
+    data["reference"] = [shorten(author, 80) + ", "  + str(yea) for author, yea in zip(data[author_column], data[year_column].astype(str) )]
+    data["reference"] = data["reference"].apply(unidecode.unidecode)
+    data["file_content"] = data["file_content"].apply(unidecode.unidecode)
+    return data
+
+
+def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summarize_results = True, ) -> tuple:
+    """
+    This function produces the adversarial claims through gpt-4 and under reference of the relevant documents.
+    """
+    openai.api_key = os.environ['OPENAI_API_KEY']
+    responses = []
+    encoding = tiktoken.encoding_for_model("gpt-4")
+    for doc in relevant_docs:
+        prompt1 = f"""
+        Presented claim:
+        {presented_claim}
+
+        Previous paper:
+        {doc.page_content}
+
+        Instructions:
+        Refine, extend, or oppose the presented claim by means of the previous paper. Provide the apa reference in text. Use two concise sentences.
+        """
+        response = perform_chat_completion(prompt1, "You are a reviewer of an academic claim; you stick to the facts from the literature.", temperature=0)
+        responses.append({"response": response, "metadata": doc.metadata, "page_content": doc.page_content})
+    if summarize_results and len(responses) > 0:
+        nr_tokens = 0
+        all_comments = ""
+        for response in responses:
+            nr_tokens += len(encoding.encode(response["response"]))
+            all_comments = f"""{all_comments}\nComment: {response["response"]}"""
+        summary_prompt = f"""
+        Presented claim:
+        {presented_claim}
+
+        Comments:
+        {all_comments}
+
+        Instructions:
+        Summarize the comments to the claim into a coherent text. Keep all the relevant apa references. Keep it concise.
+        """
+        summary_response = perform_chat_completion(summary_prompt, "You are a reviewer of an academic claim; you stick to the facts from the literature.", temperature=0)
+    else:
+        summary_response = None
+    opposition_file = f"""opposition_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}.txt"""
+    with open(opposition_file, "w", encoding="utf-8") as file:
+        file.write(f"PRESENTED CLAIM: {presented_claim}\n\n")
+        file.write(f"AI oppose suggests to review your claim with the {len(responses)} references below.\n\n")
+        for i, entry in enumerate(responses):
+            file.write(f"{i+1})\n")
+            file.write(f"""AI RESPONSE TO CLAIM:\n{insert_linebreaks(entry["response"], 140)}\n""")
+            file.write(f"""SOURCE REF:\n{insert_linebreaks(entry["metadata"]["reference"], 200)}\n""")
+            file.write(f"""SOURCE TEXT:\n{insert_linebreaks(entry["page_content"], 140)}\n\n\n""")
+    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim.")
+    return (responses, summary_response)
+
+
+def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_column: str, year_column: str, output_path = None, max_secondary = 30) -> pd.DataFrame:
+    """
+    large wrapper around ref extraction from pdf and ref extension with secondary literature
+    """
+    print("\n1/3 extracting references from pdf\n")
+    refs = extract_pdf_references(pdf_path)
+    if len(refs) == 0:
+        return None
+    data = pd.DataFrame(refs)
+    # data = pd.read_csv("temp.csv")
+    data = remove_duplicate_rows(data)
+    print(f"  --> {len(data)} refs extracted from pdf")
+    finds = []
+    entry_counts = {}
+    print("\n2/3 finding abstracts of extracted refs and related papers\n")
+    for i in range(data.shape[0]):
+        ref = {"Author": data[author_column][i], "Title": data[title_column][i], "Publication Year": data[year_column][i]}
+        find = find_metadata_for_ref(ref)
+        finds.append(find)
+        secondary_references = [r.doi for r in find["References"]]
+        secondary_citations = [r.doi for r in find["Citations"]]
+        ref_candidates = secondary_references + secondary_citations
+        for entry in ref_candidates:
+            entry_counts[entry] = entry_counts.get(entry, 0) + 1
+    data_enriched = pd.DataFrame(finds)
+    data_enriched["SOURCE"] = pdf_path
+    selected_columns = [author_column, title_column, year_column, "Abstract Note"]
+    filtered_secondary = {key: value for key, value in entry_counts.items() if key is not None}
+    max_secondary = np.min([max_secondary, len(filtered_secondary.keys())])
+    print(f"  --> {len(filtered_secondary.keys())} secondary refs found. limiting abstract search to {max_secondary}")
+    filtered_secondary = dict(sorted(filtered_secondary.items(), key=lambda item: item[1], reverse=True)[:max_secondary])
+    second_order_finds = []
+    print("\n3/3 searching for abstracts of secondary literature\n")
+    for doi in filtered_secondary:
+        try:
+            second_order_find = {}
+            t = litstudy.fetch_semanticscholar(doi)
+            second_order_find["Title"] = t.title
+            second_order_find["Author"] = ' '.join([t.authors[i].name.lower() for i in range(len(t.authors))])
+            second_order_find["Publication Year"] = t.publication_year
+            second_order_find["Abstract Note"] = t.abstract
+            second_order_find["SOURCE"] = doi
+            second_order_finds.append(second_order_find)
+        except:
+            print(f"could not retrieve doi: {doi}")
+    data_secondary_refs = pd.DataFrame(second_order_finds)
+    combined_df = pd.concat([data_enriched[selected_columns + ["SOURCE"]], data_secondary_refs], ignore_index=True)
+    combined_df['Abstract Note'] = combined_df['Abstract Note'].fillna('')
+    combined_df['Abstract Note Length'] = combined_df['Abstract Note'].str.len()
+    combined_df = combined_df.sort_values(by='Abstract Note Length', ascending=True)
+    combined_df = combined_df.drop(columns=['Abstract Note Length'])
+    combined_df = combined_df.reset_index(drop=True)
+    combined_df_clean = remove_duplicate_rows(combined_df)
+    if output_path:
+        combined_df_clean.to_csv(output_path, index = False)
+    print("\ndone.")
+    return combined_df_clean
+
+
+def generate_vectorstore(data: pd.DataFrame, filepath: str, max_doc_size = 4000) -> any:
+    """generates a folder that should not be deleted as it will be used for the claim oppositions later. 
+    it costs money to use this function as it is run with openai embedding model"""
+    booleans = ["vectorstore_" in f for f in os.listdir()]
+    if any(booleans):
+        existing_vectorstore = [f for f, b in zip(os.listdir(),booleans) if b][0]
+        userinput = input(f"Would you like to work with {existing_vectorstore} instead of generating a new vectorstore? (y/n)")
+        if "y" in userinput.lower():
+            return existing_vectorstore
+    filepath = shorten(clean_string(filepath,  filepath=True).replace("csv", ""), 40)
+    new_chroma_directory = f'vectorstore_{filepath}_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}'
+    embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
+    loader = DataFrameLoader(data[["file_content","reference"]], page_content_column = "file_content")
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=max_doc_size, chunk_overlap=0)
+    docs = text_splitter.split_documents(documents)
+    if len(data) != len(data):
+            print(f"Careful! {len(data)} files were saved as {len(docs)} documents in the vector store.")
+    if os.path.exists(new_chroma_directory) and os.path.isdir(new_chroma_directory):
+        if len(os.listdir(new_chroma_directory)) > 0:
+            print("Careful! You already seem to have files in your new_chroma_directory. You might create duplicates which affect search results.")
+    docsearch = Chroma.from_documents(docs, embeddings, persist_directory=new_chroma_directory)
+    docsearch.persist()
+    print(f"vectorstore has been generated: folder {new_chroma_directory}\n\n")
+    return new_chroma_directory
+
+
+def get_abstract_from_google(ref: dict, bias: list)-> dict:
+    """
+    takes ref dictionary, googles ref to get paper URL, gets abstract from url
+    """
+    ref["Abstract Note"] = ""
     short_author = f"""{clean_string(ref["Author"], min_word_length = 2)}""".split()[0]
-    results = search(f"""{' '.join(bias)} {short_author} {ref["Title"]}""", num_results=1)
-    time.sleep(np.random.randint(15,35))
-    url = list(results)[0]
-    ref["Abstract Note"] = extract_abstract(url)
-    ref["SOURCE"] += f"--> google: {url}"
+    url = search_with_backoff(f"""{' '.join(bias)} {short_author} {ref["Title"]}""", num_results=1)
+    time.sleep(np.random.randint(15,20))
+    if url:
+        ref["Abstract Note"] = extract_abstract(url, title = clean_string(ref["Title"]), authors = clean_string(ref["Author"], min_word_length=2))
+        ref["SOURCE"]  =  ref["SOURCE"].split("-->")[0] + f' --> {url}'
     return ref
 
 
 def get_abstract_from_scholar(ref):
     """
-    docstring pending
+    takes ref dictionary, searches scholar to get paper URL, gets abstract from url
     """
+    ref["Abstract Note"] = ""
     results = scholarly.search_single_pub(ref["Title"]) #search_pubs
-    time.sleep(np.random.randint(15,35))
+    time.sleep(np.random.randint(15,20))
     try:
         first_result = results #next(results)
     except StopIteration as e:
@@ -148,10 +603,10 @@ def get_abstract_from_scholar(ref):
         year_match = np.abs(int(year) - int(ref["Publication Year"])) <= 1
     else: 
         year_match = True
-    print(f"scholar found: {all([titles_match, authors_match, year_match])}")
+    print(f"scholar found paper: {all([titles_match, authors_match, year_match])}")
     if titles_match and authors_match and year_match:
-        ref["Abstract Note"] = extract_abstract(url)
-        ref["SOURCE"] += f"--> {url}"
+        ref["Abstract Note"] = extract_abstract(url, title = clean_string(ref["Title"]), authors = clean_string(ref["Author"]))
+        ref["SOURCE"] = ref["SOURCE"].split("-->")[0] + f' --> {url}'
     else:
         ref["SOURCE"] += f"--> SCHOLAR RESULT LOOKS LIKE MISMATCH"
     return ref
@@ -205,321 +660,6 @@ def get_relevant_docs(presented_claim: str, chroma_directory: str, max_documents
             doc.metadata = ""
     return relevant_docs
 
-    
-def extract_abstract(url):
-    """
-    docstring pending
-    """
-    chrome_options = Options()
-    # chrome_options.add_argument('--headless') 
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.get(url)
-    driver.implicitly_wait(10)
-    if url.endswith(".pdf") or url.endswith(".PDF"):
-        page_text = get_pdf_url_text(url)
-    elif "pubmed.ncbi" in url:
-        page_text = driver.find_element(By.ID, 'eng-abstract').text
-    elif "link.springer" in url:
-        parent_div = driver.find_element(By.CLASS_NAME, 'c-article-body')
-        page_text = parent_div.find_element(By.CSS_SELECTOR, "section[data-title='Abstract']").text
-    else:
-        try:
-            try:
-                abstract_divs = driver.find_elements(By.CSS_SELECTOR, '[class*="abstract"]')
-                page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
-            except:
-                abstract_divs = driver.find_element(By.CSS_SELECTOR, '[id*="abstract"]')
-                page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
-        except:
-            try:
-                page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
-            except:
-                page_text = ""
-    driver.quit()
-    return page_text
-
-
-def extract_last_names(text: str) -> str:
-    """extracts last names by assuming they are followed by a comma"""
-    try:
-        words = text.split(" ")
-        edited_text = " ".join(name for name in words if name[-1] == ",")
-        return edited_text
-    except:
-        return text
-    
-
-def extract_pdf_references(filepath: str) -> any:
-    """
-    docstring pending
-    """
-    loader = PyPDFLoader(filepath)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3500, chunk_overlap=200)
-    docs = loader.load_and_split(text_splitter=text_splitter)
-    if len(docs) == 0:
-        print("no readable text found in pdf")
-        return []
-    responses = []
-    system_prompt = "You are an AI tool that extracts reference lists from papers."
-    no_hits = 0
-    found_refs = False
-    for doc in reversed(docs):
-        prompt = f"Extract author names, paper titles, and years from the following bibliography. Respond in this list format: [{{'year': '1992', 'authors': 'E. Wiltens, A. Stone', 'title': 'effects of mdma'}}, {{'year': '2022', 'authors': 'S. Wiesen', 'title': 'durability of iron in water'}}]. Exclude journal names. Return an empty list [] if there was no bibliography or only short in-text references without paper titles. TEXT: {doc.page_content}"
-        response = perform_chat_completion(prompt= prompt, system_message=system_prompt, temperature=0)
-        ref_list = references_string_as_list(response)
-        if len(ref_list) > 0:
-            found_refs = True
-        else:
-            if found_refs: #if there were refs found previously then we might have gone up to the beginning of the bibliography
-                no_hits += 1
-                if no_hits == 2:
-                    break
-            continue
-        responses.extend(ref_list)
-    try:
-        responses = [ref for ref in responses if ref["title"] != "" and ref["authors"] != ""]
-        responses.sort(key= lambda x: clean_string(x["authors"], min_word_length=2))
-        new_key_names = {"title": "Title", "year": "Publication Year", "authors": "Author"}
-        responses = [rename_dict_keys(ref, new_key_names) for ref in responses]
-    except:
-        print("likely the LLM misformatted the pdf references")
-    return delete_duplicated_elements(responses)
-
-
-def find_metadata_for_ref(ref: dict) -> dict:
-    """
-    docstring pending
-    """
-    docs = litsearch(ref["Title"])
-    for doc in docs:
-        if doc.authors is None or doc.publication_year is None or doc.title is None:
-            print(f"skipping incomplete search result: {doc.publication_year} || {' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))])} || {doc.title}")
-            continue
-        if doc.authors  == 'N/A' or doc.publication_year == 'N/A' or doc.title == 'N/A' :
-            print(f"AAAAAAAAAAA skipping incomplete search result: {doc.publication_year} || {doc.authors} || {doc.title}")
-            continue
-        # print(f"""{ref["Publication Year"]} ||| {shorten(ref["Author"], 15)} ||| {shorten(ref["Title"].lower(), 15)}""")
-        # print(f"""{doc.publication_year} ||| {shorten(' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), 15)} ||| {shorten(doc.title.lower(), 10)}""")
-        #title
-        title_orig = clean_string(ref["Title"].lower(), min_word_length=2)
-        title_search = clean_string(doc.title.lower(), min_word_length=2)
-        titles_match = fuzz.WRatio(title_orig, title_search) > 85
-        # print(f"titles: {fuzz.WRatio(title_orig, title_search)}/85")
-        #authors
-        authors_orig = clean_string(ref["Author"].lower(), min_word_length=2)
-        authors_search = clean_string(' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), min_word_length=2)
-        authors_match = fuzz.WRatio(authors_orig, authors_search) > 70
-        # print(f"authors: {fuzz.WRatio(authors_orig, authors_search)}/70")
-        #year
-        if is_integer(ref["Publication Year"]):
-            year_match = np.abs(int(doc.publication_year) - int(ref["Publication Year"])) <= 1
-        else: 
-            year_match = False
-        # print(f"""year difference {np.abs(int(doc.publication_year) - int(ref["Publication Year"]))}""")
-        #match
-        # print(f"{year_match}, {authors_match}, {titles_match}")
-        if year_match and authors_match and titles_match:
-            ref = {"Author": ' '.join([doc.authors[i].name.lower() for i in range(len(doc.authors))]), "Title": doc.title, "Publication Year": doc.publication_year, "Abstract Note": doc.abstract, "References": [], "Citations": []}
-            if doc.references:
-                ref["References"] =  [d for d in doc.references]
-            if doc.citations:
-                ref["Citations"] = [d for d in doc.citations]
-            return ref
-    #no match
-    ref["Abstract Note"] = ""
-    ref["References"] = []
-    ref["Citations"] = []
-    return ref
-
-
-def filter_docs(presented_claim: str, relevant_docs: list) -> list:
-    """
-    This function checks whether the docs returned from the literature search are truly relevant. (internal usage)
-    """
-    openai.api_key = os.environ['OPENAI_API_KEY']
-    filtered_docs = []
-    for doc, score in relevant_docs:
-        filterprompt = f"""
-        Presented claim:
-        {presented_claim}
-
-        Target paper:
-        {doc.page_content}
-
-        Instructions:
-        Classify whether the Target Paper is relevant to the Presented Claim. Answer "yes" or "no". If unsure, answer "no".
-        """
-        filterresponse = perform_chat_completion(filterprompt, system_message="You are an attentive academic machine that only says 'yes' or 'no'.", temperature=0)
-        if "yes" in filterresponse.lower():
-            filtered_docs.append((doc, score))
-    return filtered_docs
-
-
-def format_texts_from_csv(file_path: str, abstract_column: str, author_column: str, title_column: str, year_column: str) -> pd.DataFrame:
-    """
-    columns expected in csv (with default zotero names):
-    "Abstract Note": abstract of the paper
-    "Publication Year": year of the publication
-    "Author": assumes last names are followed by comma
-    "Title": title of paper
-    """
-    try:
-        data = pd.read_csv(file_path, encoding='utf-8')
-    except:
-        data = pd.read_csv(file_path, encoding='latin1')
-    chosen_cols = [abstract_column, author_column, title_column, year_column]
-    if not all([col in data.columns for col in chosen_cols]):
-        raise ValueError(f"make sure that your csv has the chosen column headers: {chosen_cols}")
-    indices = data[data[abstract_column].isna() | data[abstract_column].eq('')].index
-    if len(indices > 0):
-        print(f'careful there are empty cells in column "{abstract_column}" resulting in empty literature entries.\nROWS: {indices}')
-    for col in chosen_cols:
-        data[col] = data[col].astype(str)
-    data[author_column] = data[author_column].apply(extract_last_names)
-    data["file_content"] = "TITLE: '" + data[title_column] + "' ABSTRACT: '" + data[abstract_column] + "' SOURCE: " + "("  + data[author_column]  + " " + data[year_column].astype(str) + ")"
-    data["reference"] = [shorten(author, 80) + " "  + str(yea) for author, yea in zip(data[author_column], data[year_column].astype(str) )]
-    data["reference"] = data["reference"].apply(unidecode.unidecode)
-    data["file_content"] = data["file_content"].apply(unidecode.unidecode)
-    return data
-
-
-def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summarize_results = True, ) -> tuple:
-    """
-    This function produces the adversarial claims through gpt-4 and under reference of the relevant documents.
-    """
-    openai.api_key = os.environ['OPENAI_API_KEY']
-    responses = []
-    encoding = tiktoken.encoding_for_model("gpt-4")
-    for doc in relevant_docs:
-        prompt1 = f"""
-        Presented claim:
-        {presented_claim}
-
-        Previous paper:
-        {doc.page_content}
-
-        Instructions:
-        Refine, extend, or oppose the presented claim by means of the previous paper. Provide the apa reference in text. Use two concise sentences.
-        """
-        response = perform_chat_completion(prompt1, "You are a reviewer of an academic claim; you stick to the facts from the literature.", temperature=0)
-        responses.append({"response": response, "metadata": doc.metadata, "page_content": doc.page_content})
-    if summarize_results and len(responses) > 0:
-        nr_tokens = 0
-        all_comments = ""
-        for response in responses:
-            nr_tokens += len(encoding.encode(response["response"]))
-            all_comments = f"""{all_comments}\nComment: {response["response"]}"""
-        summary_prompt = f"""
-        Presented claim:
-        {presented_claim}
-
-        Comments:
-        {all_comments}
-
-        Instructions:
-        Summarize the comments to the claim into a coherent text. Keep all the relevant apa references. Keep it concise.
-        """
-        summary_response = perform_chat_completion(summary_prompt, "You are a reviewer of an academic claim; you stick to the facts from the literature.", temperature=0)
-    else:
-        summary_response = None
-    opposition_file = f"""opposition_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}.txt"""
-    with open(opposition_file, "w", encoding="utf-8") as file:
-        file.write(f"PRESENTED CLAIM: {presented_claim}\n\n")
-        file.write(f"AI used {len(responses)} references.\n\n")
-        for i, entry in enumerate(responses):
-            file.write(f"{i+1})\n")
-            file.write(f"""AI RESPONSE TO CLAIM:\n{insert_linebreaks(entry["response"], 140)}\n""")
-            file.write(f"""SOURCE REF:\n{insert_linebreaks(entry["metadata"]["reference"], 200)}\n""")
-            file.write(f"""SOURCE TEXT:\n{insert_linebreaks(entry["page_content"], 140)}\n\n\n""")
-    print(f"\nThe file {opposition_file} has been generated with a source-wise response to the claim.")
-    return (responses, summary_response)
-
-
-def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_column: str, year_column: str, output_path = None, max_secondary = 20) -> pd.DataFrame:
-    """
-    docstring pending
-    """
-    print("\n1/3 extracting references from pdf\n")
-    refs = extract_pdf_references(pdf_path)
-    if len(refs) == 0:
-        return None
-    data = pd.DataFrame(refs)
-    data = remove_duplicate_rows(data)
-    print(f"  --> {len(data)} refs extracted from pdf")
-    finds = []
-    entry_counts = {}
-    print("\n2/3 finding abstracts of extracted refs and related papers\n")
-    for i in range(data.shape[0]):
-        ref = {"Author": data[author_column][i], "Title": data[title_column][i], "Publication Year": data[year_column][i]}
-        find = find_metadata_for_ref(ref)
-        finds.append(find)
-        secondary_references = [r.doi for r in find["References"]]
-        secondary_citations = [r.doi for r in find["Citations"]]
-        ref_candidates = secondary_references + secondary_citations
-        for entry in ref_candidates:
-            entry_counts[entry] = entry_counts.get(entry, 0) + 1
-    data_enriched = pd.DataFrame(finds)
-    data_enriched["SOURCE"] = pdf_path
-    selected_columns = [author_column, title_column, year_column, "Abstract Note"]
-    filtered_secondary = {key: value for key, value in entry_counts.items() if key is not None}
-    max_secondary = np.min([max_secondary, len(filtered_secondary.keys())])
-    print(f"  --> {len(filtered_secondary.keys())} secondary refs found. limiting abstract search to {max_secondary}")
-    filtered_secondary = dict(sorted(filtered_secondary.items(), key=lambda item: item[1], reverse=True)[:max_secondary])
-    second_order_finds = []
-    print("\n3/3 searching for abstracts of secondary literature\n")
-    for doi in filtered_secondary:
-        try:
-            second_order_find = {}
-            t = litstudy.fetch_semanticscholar(doi)
-            second_order_find["Title"] = t.title
-            second_order_find["Author"] = ' '.join([t.authors[i].name.lower() for i in range(len(t.authors))])
-            second_order_find["Publication Year"] = t.publication_year
-            second_order_find["Abstract Note"] = t.abstract
-            second_order_find["SOURCE"] = doi
-            second_order_finds.append(second_order_find)
-        except:
-            print(f"could not retrieve doi: {doi}")
-    data_secondary_refs = pd.DataFrame(second_order_finds)
-    combined_df = pd.concat([data_enriched[selected_columns + ["SOURCE"]], data_secondary_refs], ignore_index=True)
-    combined_df['Abstract Note'] = combined_df['Abstract Note'].fillna('')
-    combined_df['Abstract Note Length'] = combined_df['Abstract Note'].str.len()
-    combined_df = combined_df.sort_values(by='Abstract Note Length', ascending=True)
-    combined_df = combined_df.drop(columns=['Abstract Note Length'])
-    combined_df = combined_df.reset_index(drop=True)
-    combined_df.to_csv(f"duplicates_{output_path}")
-    combined_df_clean = remove_duplicate_rows(combined_df)
-    if output_path:
-        combined_df_clean.to_csv(output_path)
-    print("\ndone.")
-    return combined_df_clean
-
-
-def generate_vectorstore(data: pd.DataFrame, filepath: str, max_doc_size = 4000) -> any:
-    """generates a folder that should not be deleted as it will be used for the claim oppositions later. 
-    it costs money to use this function as it is run with openai embedding model"""
-    booleans = ["vectorstore_" in f for f in os.listdir()]
-    if any(booleans):
-        existing_vectorstore = [f for f, b in zip(os.listdir(),booleans) if b][0]
-        userinput = input(f"Would you like to work with {existing_vectorstore} instead of generating a new vectorstore? (y/n)")
-        if "y" in userinput.lower():
-            return existing_vectorstore
-    filepath = shorten(clean_string(filepath, remove_single_letters=False, filepath=True).replace("csv", ""), 40)
-    new_chroma_directory = f'vectorstore_{filepath}_{time.ctime().replace(":", "").replace(" ", "")[0:-4]}'
-    embeddings = OpenAIEmbeddings(openai_api_key=os.environ['OPENAI_API_KEY'])
-    loader = DataFrameLoader(data[["file_content","reference"]], page_content_column = "file_content")
-    documents = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=max_doc_size, chunk_overlap=0)
-    docs = text_splitter.split_documents(documents)
-    if len(data) != len(data):
-            print(f"Careful! {len(data)} files were saved as {len(docs)} documents in the vector store.")
-    if os.path.exists(new_chroma_directory) and os.path.isdir(new_chroma_directory):
-        if len(os.listdir(new_chroma_directory)) > 0:
-            print("Careful! You already seem to have files in your new_chroma_directory. You might create duplicates which affect search results.")
-    docsearch = Chroma.from_documents(docs, embeddings, persist_directory=new_chroma_directory)
-    docsearch.persist()
-    print(f"vectorstore has been generated: folder {new_chroma_directory}\n\n")
-    return new_chroma_directory
-
 
 def get_example_literature_file(lit = "egodepletion"):
     """
@@ -542,7 +682,8 @@ def get_example_literature_file(lit = "egodepletion"):
 
 def get_pdf_url_text(pdf_url: str, max_len = 3500, split_on_abstract = True) -> str:
     """
-    docstring pending
+    DEPRECATED
+    used to extract research abstract from pdf file
     """
     response = requests.get(pdf_url)
     pdf_data = response.content
@@ -582,9 +723,9 @@ def insert_linebreaks(text: str, interval: int) -> str:
     return '\n'.join(lines)
 
 
-def is_integer(string):
+def is_integer(string: str) -> bool:
     """
-    docstring pending
+    checks whether string can be converted to valid integer
     """
     try:
         int(string)
@@ -593,26 +734,53 @@ def is_integer(string):
         return False
 
 
-def litsearch(q: str) -> any:
+def litsearch(q: str) -> list:
     """
-    docstring pending
+    accepts query string
+    uses litstudy package to query semanticscholar/crossfref
+    returns list of results
     """
     q = clean_string(q)
     try:
-        docs = litstudy.search_semanticscholar(q, limit = 5, batch_size=5)
+        docs = litstudy.search_semanticscholar(q, limit = 3, batch_size=3)
     except:
         try:
             q_words = q.split(" ")
             q_shortened = " ".join(q_words[0:int(len(q_words)/2)])
-            docs = litstudy.search_semanticscholar(q_shortened, limit = 4, batch_size=4)
+            docs = litstudy.search_semanticscholar(q_shortened, limit = 3, batch_size=3)
         except:
             try:
-                docs = litstudy.search_crossref(q, limit = 4)
+                docs = litstudy.search_crossref(q, limit = 3)
             except:
                 print(f"search fail for semantic scholar and crossref: {q}")
                 docs = []
     docs = [doc for doc in docs]
     return docs
+
+
+def manual_entry_abstracts(infile: str, outfile: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(infile, keep_default_na=False, encoding='utf-8')
+    except:
+        df = pd.read_csv(infile, keep_default_na=False, encoding='latin1')
+    for i in range(len(df)):
+        if len(str(df.loc[i, "Abstract Note"])) < 50 or pd.isna(df.loc[i, "Abstract Note"]):
+            print(f'{df.loc[i, "Author"]} {df.loc[i, "Publication Year"]}')
+            print(df.loc[i, "Title"])
+            print()
+            time.sleep(0.15)
+            new_abstract = input("Paste in missing abstract. 's' skips remaining. 'd' deletes previous entry.")
+            if new_abstract.lower() == "sa":
+                df.to_csv(outfile, index=False)
+                return df
+            if new_abstract.lower() == "d":
+                df.loc[i-1, "Abstract Note"] = ""
+                print("deleted last. suggesting to rerun manual_entry_abstracts() function.")
+                df.to_csv(outfile, index=False)
+                return df
+            df.loc[i, "Abstract Note"] = new_abstract
+            df.to_csv(outfile, index=False)
+    return df
 
 
 def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> str:
@@ -632,16 +800,16 @@ def perform_chat_completion(prompt: str, system_message: str, temperature=0) -> 
             return response["choices"][0]["message"]["content"].strip()
         except Exception as e:
             retries += 1
-            print(e)
             print(f"potential openai api issue (overload etc). trying again...({retries}/{max_retries})")
             time.sleep(backoff_time)
             backoff_time *= 2  # Exponential backoff
     return f"API Error {prompt}"
 
 
-def references_string_as_list(input_string):
+def references_string_as_list(input_string: str) -> list:
     """
-    docstring pending
+    converts string to list if possible via eval()
+    used to convert gpt response to python list
     """
     if not ("[" in input_string and "]" in input_string):
         print("no brackets found in extracted references")
@@ -657,9 +825,12 @@ def references_string_as_list(input_string):
         return []
 
 
-def remove_duplicate_rows(df, similarity_threshold=90):
+def remove_duplicate_rows(df:pd.DataFrame, similarity_threshold=90):
     """
-    docstring pending
+    for a pd.DataFrame containing literature records
+    this function returns dataframe with very similar rows removed
+    similarity determined based on Author, Title, and Publication Year
+    similarity can be set via similarity_threshold (default 90)
     """
     marked_duplicates = set()
     for outer_index, outer_row in df.iterrows():
@@ -683,18 +854,39 @@ def remove_duplicate_rows(df, similarity_threshold=90):
                 if author_similarity > similarity_threshold and title_similarity > similarity_threshold and year_similarity <= 1:
                     marked_duplicates.add(inner_index)
     deduplicated_df = df.drop(index=marked_duplicates)
+    deduplicated_df = deduplicated_df.reset_index(drop=True)
     return deduplicated_df
 
 
-def rename_dict_keys(input_dict, key_mapping):
+def rename_dict_keys(input_dict: dict, key_mapping: dict) -> dict:
     """
-    docstring pending
+    function to change keys of dict
     """
     new_dict = {}
     for old_key, new_key in key_mapping.items():
         if old_key in input_dict:
             new_dict[new_key] = input_dict[old_key]
     return new_dict
+
+
+def search_with_backoff(query, num_results=1, max_retries=5, retry_delay_base=15):
+    """
+    search google via googlesearch package. use exponential backoff in case of rate limit
+    """
+    for retry_count in range(max_retries):
+        try:
+            results = search(query, num_results)
+            return list(results)[0]
+        except Exception as e:
+            print(f"Attempt {retry_count + 1} failed: {e}")
+            # Calculate the exponential backoff delay
+            retry_delay = retry_delay_base * 2 ** retry_count
+            # Add some jitter to the delay to prevent synchronization
+            retry_delay += np.random.randint(1, 6)  # Random value between 1 and 5
+            print(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    print("Max retries reached, operation failed.")
+    return None  # Return None to indicate failure
 
 
 def shorten(text: str, length: int) -> str:
@@ -704,3 +896,15 @@ def shorten(text: str, length: int) -> str:
     if len(text) > length:
         return text[0:length]
     return text
+
+
+def sort_according_to_abstract_len(temp: pd.DataFrame) -> pd.DataFrame:
+    """
+    sort dataframe according to length of string in column "Abstract Note"
+    """
+    temp['Abstract Note'] = temp['Abstract Note'].fillna('')
+    temp['Abstract Note Length'] = temp['Abstract Note'].str.len()
+    temp = temp.sort_values(by='Abstract Note Length', ascending=True)
+    # temp = temp.drop(columns=['Abstract Note Length'])
+    temp = temp.reset_index(drop=True)
+    return temp
