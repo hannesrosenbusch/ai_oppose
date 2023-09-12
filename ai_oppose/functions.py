@@ -11,6 +11,8 @@ import shutil
 import requests
 import time
 import re
+from datetime import datetime
+
 
 import numpy as np
 import pandas as pd
@@ -25,10 +27,36 @@ from googlesearch import search
 
 from fuzzywuzzy import fuzz
 import PyPDF2
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+
+
+def analyze_paragraphs(pdffile: str, max_paragraphs = 5) -> list:
+    sections = []
+    loader = PyPDFLoader(pdffile)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200, separators=["\n"])
+    docs = loader.load_and_split(text_splitter=text_splitter)
+    if len(docs) == 0:
+        print("no readable text found in pdf")
+        return []
+    limit = np.min([max_paragraphs - 1, len(docs) - 1])
+    for doc in docs[0:limit]:
+        #summary
+        prompt1 = f"Summarize the following paragraph into a single sentence. Prioritize brevity. If there is no coherent text, just say: 'No coherent text.'. Otherwise start your response with 'In this paragraph, the authors...' Paragraph: <<<{doc.page_content}>>>"
+        system_prompt1 = "You are an AI model that excels at analyzing research paragraphs."
+        response1 = perform_chat_completion(prompt=prompt1, system_message=system_prompt1, temperature=0)
+        #main claim
+        prompt2 = f"Extract the central claim from the following paragraph. Reproduce the claim within one sentence (Example responses: 'A low sodium diet reduces the risk of heart disease.', 'The attention mechanism was not pioneered in transformer architectures.'). If there is no claim, just say: ''. Paper snippet: <<<{doc.page_content}>>>"
+        system_prompt2 = "You are an AI model that extracts claims from text paragraphs. You state the claim in a concise sentence (Example response: 'Bananas are yellow')."
+        response2 = perform_chat_completion(prompt=prompt2, system_message=system_prompt2, temperature=0)
+        section = {"claim": response2, "page_content": doc.page_content, "summary": response1, "opposition": 'opposition pending', "refs": []}
+        sections.append(section)
+    return sections
 
 
 def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
@@ -69,9 +97,63 @@ def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
             if outpath:
                 sort_according_to_abstract_len(df).to_csv(outpath, index = False)
     mask = (df["Abstract Note"].str.len() < 50) | (df["Abstract Note"].isna())
-    print(f"DONT USE EXCEL FOR ADDING {mask.sum()} MISSING ABSTRACTS! USE FUNCTION >>> manual_entry_abstracts(infile = 'mylit.csv', outfile = 'mylit.csv')")
-    print(f'AFTER COMBINING MULTIPLE LITERATURE_DFs (e.g., pandas.merge/concatenate) YOU MIGHT USE >>> ai_oppose.remove_duplicate_rows(df: pd.DataFrame, similarity_threshold=90)')
+    print(f"DONT USE EXCEL FOR ADDING {mask.sum()} MISSING ABSTRACTS! USE FUNCTION >>> manual_entry_abstracts(infile = '{outpath}', outfile = '{outpath}')")
     return sort_according_to_abstract_len(df)
+
+
+def create_pdf_from_dicts(sections, output_file):
+    doc = SimpleDocTemplate(output_file, pagesize=letter)
+    styles = getSampleStyleSheet()
+    heading_style = ParagraphStyle(name='BoldStyle', parent=styles['Normal'])
+    heading_style.fontName = 'Helvetica-Bold'
+    heading_style.alignment = 1 # Left alignment
+    italic_style = ParagraphStyle(name='ItalicStyle', parent=styles['Normal'])
+    italic_style.fontName = 'Helvetica-Oblique'
+    italic_style.alignment = 0  # Left alignment
+    bold_style = ParagraphStyle(name='BoldStyle', parent=styles['Normal'])
+    bold_style.fontName = 'Helvetica-Bold'
+    bold_style.alignment = 0 # Left alignment
+    story = []
+    heading = Paragraph("Your AI Review\n", heading_style)
+    story.append(heading)
+    story.append(Spacer(1, 20)) 
+    intro1 = Paragraph("Dear reader,")
+    story.append(intro1)
+    story.append(Spacer(1, 5)) 
+    intro2 = Paragraph("On the following pages, I will present you with my analyses for the individual sections of your pdf file. Please be aware that I, as an AI, do not have the same capabilities as a human reviewer. I might misunderstand or make up things. That is why I always provide the references for you to verify my work. Use my outputs as shortcuts to finding new ideas and relevant material.", styles["Normal"])
+    story.append(intro2)
+    story.append(Spacer(1, 5)) 
+    intro3 = Paragraph("Sincerely,")
+    story.append(intro3)
+    story.append(Spacer(1, 5)) 
+    intro4 = Paragraph("AI OPPOSE")
+    story.append(intro4)
+    story.append(Spacer(1, 4)) 
+    current_date = datetime.now().strftime("%B %d, %Y")
+    date_location = Paragraph(f"{current_date}<br/>", styles["Normal"])
+    story.append(date_location)
+    story.append(PageBreak())
+    for i, item in enumerate(sections, start=1):
+        page_content = item.get("page_content", "")
+        claim = item.get("claim", "")
+        summary = item.get("summary", "")
+        opposition = item.get("opposition", "")
+        refs = ("\n").join(item.get("refs", []))
+        section_headline = f"SECTION {i}"
+        story.append(Paragraph(section_headline, bold_style))
+        story.append(Paragraph("You wrote:", bold_style))
+        story.append(Paragraph(f"{page_content}", styles["Normal"]))
+        story.append(Paragraph("My summary:", bold_style))
+        story.append(Paragraph(f"{summary}", styles["Normal"]))
+        story.append(Paragraph("Observed claim:", bold_style))
+        story.append(Paragraph(f"{claim}", styles["Normal"]))
+        story.append(Paragraph("My opposition:", bold_style))
+        story.append(Paragraph(f"{opposition}", styles["Normal"]))
+        story.append(Paragraph("References:", bold_style))
+        story.append(Paragraph(f"{refs}", italic_style))
+        if i < len(sections):
+            story.append(PageBreak())
+    doc.build(story)
 
 
 def clean_string(input_string: str, min_word_length = 0, filepath = False, remove_numbers = False) -> str:
@@ -122,7 +204,7 @@ def extract_abstract(url: str, title: str, authors: str) -> str:
     returns abstract or empty string
     """
     title_mismatch = True
-    author_mismatch = True
+    authors_mismatch = True
     try:
         chrome_options = Options()
         driver = webdriver.Chrome(options=chrome_options)
@@ -220,17 +302,6 @@ def extract_abstract(url: str, title: str, authors: str) -> str:
                 print(e)
                 page_text = ""
         else:
-            # try:
-            #     try:
-            #         abstract_divs = driver.find_elements(By.CSS_SELECTOR, '[class*="abstract"]')
-            #         page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
-            #     except:
-            #         abstract_divs = driver.find_element(By.CSS_SELECTOR, '[id*="abstract"]')
-            #         page_text = [abstract_div.text for abstract_div in abstract_divs if len(abstract_div.text) > 50][0]
-            # except:
-            #     try:
-            #         page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
-            #     except:
             page_text = ""
         if title_mismatch or authors_mismatch:
             page_text = ""
@@ -240,25 +311,6 @@ def extract_abstract(url: str, title: str, authors: str) -> str:
         print(e)
         page_text = ""
     return page_text.replace("\n", " ")
-
-
-def extract_claim_per_paragraph(pdffile: str, max_paragraphs = 5) -> list:
-    sections = []
-    loader = PyPDFLoader(pdffile)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200, separators=["\n"])
-    docs = loader.load_and_split(text_splitter=text_splitter)
-    if len(docs) == 0:
-        print("no readable text found in pdf")
-        return []
-    limit = np.min([max_paragraphs - 1, len(docs) - 1])
-    for doc in docs[0:limit]:
-        prompt = f"Extract the central claim from the following paragraph. Reproduce the claim within one sentence (Example responses: 'A low sodium diet reduces the risk of heart disease.', 'The attention mechanism was not pioneered in transformer architectures.'). If there is no claim, just say: ''. Paper snippet: <<<{doc.page_content}>>>"
-        system_prompt = "You are an AI model that extracts claims from text paragraphs. You state the claim in a concise sentence (Example response: 'Bananas are yellow')."
-        response = perform_chat_completion(prompt=prompt, system_message=system_prompt, temperature=0)
-        section = {"claim": response, "page_content": doc.page_content}
-        sections.append(section)
-    print(len(docs))
-    return sections
 
 
 def extract_focal_claims(pdf_path: str, max_claims = 3) -> list:
@@ -492,11 +544,12 @@ def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_co
         for entry in ref_candidates:
             entry_counts[entry] = entry_counts.get(entry, 0) + 1
     data_enriched = pd.DataFrame(finds)
+    print(f"AAAAAA  --> {len(data_enriched)} primary refs")
     data_enriched["SOURCE"] = pdf_path
     selected_columns = [author_column, title_column, year_column, "Abstract Note"]
     filtered_secondary = {key: value for key, value in entry_counts.items() if key is not None}
     max_secondary = np.min([max_secondary, len(filtered_secondary.keys())])
-    print(f"  --> {len(filtered_secondary.keys())} secondary refs found. limiting abstract search to {max_secondary}")
+    print(f"AAAAAAA  --> {len(filtered_secondary.keys())} secondary refs found. limiting abstract search to {max_secondary}")
     filtered_secondary = dict(sorted(filtered_secondary.items(), key=lambda item: item[1], reverse=True)[:max_secondary])
     second_order_finds = []
     print("\n3/3 searching for abstracts of secondary literature\n")
@@ -513,13 +566,16 @@ def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_co
         except:
             print(f"could not retrieve doi: {doi}")
     data_secondary_refs = pd.DataFrame(second_order_finds)
+    print(f"AAAAAAA  --> {len(data_secondary_refs)} secondary refs left")
     combined_df = pd.concat([data_enriched[selected_columns + ["SOURCE"]], data_secondary_refs], ignore_index=True)
     combined_df['Abstract Note'] = combined_df['Abstract Note'].fillna('')
     combined_df['Abstract Note Length'] = combined_df['Abstract Note'].str.len()
     combined_df = combined_df.sort_values(by='Abstract Note Length', ascending=True)
     combined_df = combined_df.drop(columns=['Abstract Note Length'])
     combined_df = combined_df.reset_index(drop=True)
+    print(f"AAAAAAA  --> {len(combined_df)} combined refs")
     combined_df_clean = remove_duplicate_rows(combined_df)
+    print(f"AAAAAAA  --> {len(combined_df_clean)} combined refs")
     if output_path:
         combined_df_clean.to_csv(output_path, index = False)
     print("\ndone.")
@@ -680,10 +736,10 @@ def get_example_literature_file(lit = "egodepletion"):
     shutil.copy(source_path, destination_path)
 
 
-def get_pdf_url_text(pdf_url: str, max_len = 3500, split_on_abstract = True) -> str:
+def get_pdf_abstract(pdf_url: str, max_len = 3500, split_on_abstract = True) -> str:
     """
     DEPRECATED
-    used to extract research abstract from pdf file
+    used to extract research abstract from (URL to) pdf file
     """
     response = requests.get(pdf_url)
     pdf_data = response.content
@@ -723,14 +779,17 @@ def insert_linebreaks(text: str, interval: int) -> str:
     return '\n'.join(lines)
 
 
-def is_integer(string: str) -> bool:
+def is_integer(val: any) -> bool:
     """
     checks whether string can be converted to valid integer
     """
     try:
-        int(string)
+        print(val)
+        print(type(val))
+        int(val)
         return True
-    except ValueError:
+    except ValueError as e:
+        print(e)
         return False
 
 
@@ -765,12 +824,16 @@ def manual_entry_abstracts(infile: str, outfile: str) -> pd.DataFrame:
         df = pd.read_csv(infile, keep_default_na=False, encoding='latin1')
     for i in range(len(df)):
         if len(str(df.loc[i, "Abstract Note"])) < 50 or pd.isna(df.loc[i, "Abstract Note"]):
-            print(f'{df.loc[i, "Author"]} {df.loc[i, "Publication Year"]}')
+            if isinstance(df.loc[i, "Publication Year"], str):
+                print(f'{df.loc[i, "Author"]} {df.loc[i, "Publication Year"].replace(".0","")}')
+            else:
+                print(f'{df.loc[i, "Author"]} {df.loc[i, "Publication Year"]}')
             print(df.loc[i, "Title"])
             print()
-            time.sleep(0.15)
+            test = 1
+            time.sleep(0.2)
             new_abstract = input("Paste in missing abstract. 's' skips remaining. 'd' deletes previous entry.")
-            if new_abstract.lower() == "sa":
+            if new_abstract.lower() == "s":
                 df.to_csv(outfile, index=False)
                 return df
             if new_abstract.lower() == "d":
@@ -905,6 +968,6 @@ def sort_according_to_abstract_len(temp: pd.DataFrame) -> pd.DataFrame:
     temp['Abstract Note'] = temp['Abstract Note'].fillna('')
     temp['Abstract Note Length'] = temp['Abstract Note'].str.len()
     temp = temp.sort_values(by='Abstract Note Length', ascending=True)
-    # temp = temp.drop(columns=['Abstract Note Length'])
+    temp = temp.drop(columns=['Abstract Note Length'])
     temp = temp.reset_index(drop=True)
     return temp
