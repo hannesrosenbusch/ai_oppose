@@ -97,7 +97,7 @@ def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
             if outpath:
                 sort_according_to_abstract_len(df).to_csv(outpath, index = False)
     mask = (df["Abstract Note"].str.len() < 50) | (df["Abstract Note"].isna())
-    print(f"DONT USE EXCEL FOR ADDING {mask.sum()} MISSING ABSTRACTS! USE FUNCTION >>> manual_entry_abstracts(infile = '{outpath}', outfile = '{outpath}')")
+    print(f"DONT USE EXCEL FOR ADDING {mask.sum()} MISSING ABSTRACTS! USE FUNCTION >>> manual_entry_abstracts(infile = '{outpath}', outfile = '{outpath}')\n AUTOSEARCH DONE.\n\n")
     return sort_according_to_abstract_len(df)
 
 
@@ -114,7 +114,7 @@ def create_pdf_from_dicts(sections, output_file):
     bold_style.fontName = 'Helvetica-Bold'
     bold_style.alignment = 0 # Left alignment
     story = []
-    heading = Paragraph("Your AI Review\n", heading_style)
+    heading = Paragraph("AI OPPOSE: Section-wise Review\n", heading_style)
     story.append(heading)
     story.append(Spacer(1, 20)) 
     intro1 = Paragraph("Dear reader,")
@@ -283,20 +283,49 @@ def extract_abstract(url: str, title: str, authors: str) -> str:
                 page_text = ""
         elif "www.ncbi." in url:
             try:
-                print(url)
                 driver.get(url)
                 driver.implicitly_wait(10)
                 try:
                     page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
                 except:
                     page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Summary')]/following-sibling::*[1]").text
-                print(page_text)
                 title_found = clean_string(driver.find_element(By.CLASS_NAME, 'content-title').text)
                 title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
                 preceding_element = driver.find_element(By.CLASS_NAME, 'content-title')
                 following_div = preceding_element.find_element(By.XPATH, "following-sibling::div")
                 authors_found = following_div.text
                 authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                print(e)
+                page_text = ""
+        elif "journals.sagepub" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                try:
+                    page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Abstract')]/following-sibling::*[1]").text
+                except:
+                    page_text = driver.find_element(By.XPATH, "//*[contains(text(), 'Summary')]/following-sibling::*[1]").text
+                title_found = clean_string(driver.find_element(By.TAG_NAME, 'h1').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                authors_found = driver.find_element(By.CLASS_NAME, 'authors').text.replace(" and ", " ")
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                driver.quit()
+            except Exception as e:
+                print(e)
+                page_text = ""
+
+        elif "aeaweb.org" in url:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                title_found = clean_string(driver.find_element(By.CLASS_NAME, 'title').text)
+                title_mismatch = fuzz.WRatio(clean_string(title), title_found) < 85
+                authors_found = driver.find_element(By.CLASS_NAME, 'attribution').text
+                authors_mismatch = fuzz.WRatio(authors, clean_string(authors_found, min_word_length=2)) < 70
+                article = driver.find_element(By.ID, "article-information").text
+                page_text = article.split("Citation")[0]
                 driver.quit()
             except Exception as e:
                 print(e)
@@ -467,7 +496,7 @@ def format_texts_from_csv(file_path: str, abstract_column: str, author_column: s
     return data
 
 
-def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summarize_results = True, ) -> tuple:
+def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summarize_results = True) -> tuple:
     """
     This function produces the adversarial claims through gpt-4 and under reference of the relevant documents.
     """
@@ -519,7 +548,7 @@ def generate_adversarial_texts(presented_claim: str, relevant_docs: list,  summa
     return (responses, summary_response)
 
 
-def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_column: str, year_column: str, output_path = None, max_secondary = 30) -> pd.DataFrame:
+def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_column: str, year_column: str, output_path = None, max_secondary = 50) -> pd.DataFrame:
     """
     large wrapper around ref extraction from pdf and ref extension with secondary literature
     """
@@ -544,12 +573,10 @@ def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_co
         for entry in ref_candidates:
             entry_counts[entry] = entry_counts.get(entry, 0) + 1
     data_enriched = pd.DataFrame(finds)
-    print(f"AAAAAA  --> {len(data_enriched)} primary refs")
     data_enriched["SOURCE"] = pdf_path
     selected_columns = [author_column, title_column, year_column, "Abstract Note"]
     filtered_secondary = {key: value for key, value in entry_counts.items() if key is not None}
     max_secondary = np.min([max_secondary, len(filtered_secondary.keys())])
-    print(f"AAAAAAA  --> {len(filtered_secondary.keys())} secondary refs found. limiting abstract search to {max_secondary}")
     filtered_secondary = dict(sorted(filtered_secondary.items(), key=lambda item: item[1], reverse=True)[:max_secondary])
     second_order_finds = []
     print("\n3/3 searching for abstracts of secondary literature\n")
@@ -566,16 +593,13 @@ def generate_literature_csv_from_pdf(pdf_path: str, author_column: str, title_co
         except:
             print(f"could not retrieve doi: {doi}")
     data_secondary_refs = pd.DataFrame(second_order_finds)
-    print(f"AAAAAAA  --> {len(data_secondary_refs)} secondary refs left")
     combined_df = pd.concat([data_enriched[selected_columns + ["SOURCE"]], data_secondary_refs], ignore_index=True)
     combined_df['Abstract Note'] = combined_df['Abstract Note'].fillna('')
     combined_df['Abstract Note Length'] = combined_df['Abstract Note'].str.len()
     combined_df = combined_df.sort_values(by='Abstract Note Length', ascending=True)
     combined_df = combined_df.drop(columns=['Abstract Note Length'])
     combined_df = combined_df.reset_index(drop=True)
-    print(f"AAAAAAA  --> {len(combined_df)} combined refs")
     combined_df_clean = remove_duplicate_rows(combined_df)
-    print(f"AAAAAAA  --> {len(combined_df_clean)} combined refs")
     if output_path:
         combined_df_clean.to_csv(output_path, index = False)
     print("\ndone.")
@@ -784,12 +808,9 @@ def is_integer(val: any) -> bool:
     checks whether string can be converted to valid integer
     """
     try:
-        print(val)
-        print(type(val))
         int(val)
         return True
     except ValueError as e:
-        print(e)
         return False
 
 
