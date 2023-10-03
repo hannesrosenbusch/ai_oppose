@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: ai-oppose
-Version: 0.0.10
+Version: 0.0.41
 Summary: generating adversarial takes on science claims with openai plus vectorstores
 Home-page: https://github.com/hannesrosenbusch/ai_oppose
 Author: Hannes Rosenbusch
@@ -10,5 +10,12 @@ Classifier: License :: OSI Approved :: MIT License
 Classifier: Operating System :: OS Independent
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
+Requires-Dist: chromadb==0.4.5
+Requires-Dist: langchain==0.0.257
+Requires-Dist: tiktoken==0.4.0
+Requires-Dist: Unidecode==1.3.6
+Requires-Dist: unstructured==0.9.0
+Requires-Dist: openai==0.27.8
+Requires-Dist: pandas
 
 package for AI opposition of scientific claims (under development)
