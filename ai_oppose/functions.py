@@ -1,5 +1,4 @@
 #cost estimation 
-
 import langchain
 from langchain.document_loaders import DataFrameLoader #, PyPDFLoader
 from langchain.docstore.document import Document
@@ -44,7 +43,7 @@ def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500,
     If so it provides a summary and extracts the main claim in the section.
     Theses summaries and claims will be displayed in the review pdf, and they steer the literature search for the critique of this section.
     """
-    print("\n---analyzing individual sections in {pdffile}")
+    print(f"\n---analyzing individual sections in {pdffile}")
     sections = []
     pdftext = trim_pdf(pdffile, lower, upper, left, verbose)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=paragraph_length, chunk_overlap=0, separators=["\n\n", ". "], keep_separator=False)
@@ -86,7 +85,7 @@ def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500,
     return sections
 
 
-def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
+def autosearch_missing_abstracts(file_path: str, outpath: str, serp_key: str) -> pd.DataFrame:
     """"
     this function replaces short (<50) and missing abstracts from the provided csv through calls to google scholar and google.
     abstract source/url is added to output dataframe/file.
@@ -110,15 +109,15 @@ def autosearch_missing_abstracts(file_path: str, outpath: str) -> pd.DataFrame:
                     new_ref = get_abstract_from_scholar(dict(df.loc[i,:]))
                     if new_ref["Abstract Note"] == "":
                         print("failed to get abstract from scholar-based url. trying google")
-                        new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = ["pubmed", "springer"])
+                        new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = [], serp_key=serp_key)
                 except Exception as e:
                     use_google = True
             if use_google:
                 print("AI OPPOSE MESSAGE: hit google scholar rate limit; using google")
-                new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = ["pubmed", "springer"])
+                new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = [], serp_key=serp_key)
                 if new_ref["Abstract Note"] == "":
                     print("try raw google")
-                    new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = [])
+                    new_ref = get_abstract_from_google(dict(df.loc[i,:]), bias = [], serp_key=serp_key)
             print(new_ref["SOURCE"])
             print(f"""length new abstract: {len(new_ref["Abstract Note"])}""")
             df.loc[i, "Abstract Note"] = new_ref["Abstract Note"]
@@ -464,15 +463,19 @@ def extract_abstract(url: str, title: str, authors: str, query_only = False) -> 
                 page_text = ""
         else:
             page_text = ""
-        if page_text == "":
-            print(url)
-        if not query_only and (title_mismatch or authors_mismatch):
-            page_text = ""
+        # if page_text == "":
+        #     print(url)
+        print(f"ptext:: {page_text}")
+        if not query_only: 
+            if title_mismatch or authors_mismatch:
+                print(f"here here {title_mismatch} {authors_mismatch}")
+                page_text = ""
         if page_text.lower().startswith("abstract\n"):
             page_text = page_text[len("abstract\n"):]
     except Exception as e:
         print(e)
         page_text = ""
+        
     if query_only:
         if page_text != "":
             return {"Author": authors_found, "Title": title_found, "Publication Year": None, "Abstract Note": page_text.replace("\n", " "), "SOURCE": url}
@@ -716,7 +719,7 @@ def generate_dict_from_pdf(pdf_path: str, openai_model: str, max_len = 3500, spl
 
 
 
-def generate_literature_csv_from_pdf(pdf_path: str, openai_model: str, author_column: str, title_column: str, year_column: str, max_secondary: int, output_path = None,  lower = 0, upper = 10000, left = 0, verbose = False, include_source_as_ref = False) -> pd.DataFrame:
+def generate_literature_csv_from_pdf(pdf_path: str, openai_model: str, author_column: str, title_column: str, year_column: str, max_secondary: int, output_path = None,  lower = 0, upper = 10000, left = 0, verbose = False, include_source_as_ref = False, serp_key = None) -> pd.DataFrame:
     """
     large wrapper around ref extraction from pdf and ref extension with secondary literature
     """
@@ -734,8 +737,9 @@ def generate_literature_csv_from_pdf(pdf_path: str, openai_model: str, author_co
     for i in range(2):
         query = perform_chat_completion(prompt=f"come up with a relevant search query (max 6 words) for the provided abstract (e.g., 'sleep AND depression'). the goal is to search for papers critical of the abstract! if unsure just say: ''. The abstract <<<{abstract}>>>", system_message=f"You are an AI model that generates searchterms. Forbidden terms: {forbidden_terms}", openai_model = openai_model)
         forbidden_terms.append(query)
-        finds = get_abstract_from_google({"query": f"paper {query}"}, bias = [], query_only = True)
-        all_finds.extend(finds)
+        finds = get_abstract_from_google({"query": f"paper {query}"}, bias = [], query_only = True, serp_key=serp_key)
+        if finds:
+            all_finds.extend(finds)
     if include_source_as_ref:
         primary_ref = generate_dict_from_pdf(pdf_path, openai_model, only_abstract=False)
         all_finds.append(primary_ref)
@@ -820,13 +824,15 @@ def generate_vectorstore(data: pd.DataFrame, filepath: str, max_doc_size = 4000)
     return new_chroma_directory
 
 
-def get_abstract_from_google(ref: dict, bias: list, query_only = False)-> any:
+def get_abstract_from_google(ref: dict, bias: list, query_only = False, serp_key = None)-> any:
     """
     takes ref dictionary, googles ref to get paper URL, gets abstract from url
     """
     if query_only:
         ref_dicts = []
-        urls = search_with_backoff(f"""{ref["query"]}""", num_results = 10)
+        urls = search_with_backoff(f"""{ref["query"]}""", num_results = 8, serp_key = serp_key)
+        if urls == None:
+            return None
         for url in urls:
             dic = extract_abstract(url, "", "", query_only=True)
             ref_dicts.append(dic)
@@ -835,10 +841,11 @@ def get_abstract_from_google(ref: dict, bias: list, query_only = False)-> any:
         ref["Abstract Note"] = ""
         if f"""{clean_string(ref["Author"], min_word_length = 2)}""" == "":
             return ref
-        # try:
-        short_author = f"""{clean_string(ref["Author"], min_word_length = 2)}""".split()[0]
-        url = search_with_backoff(f"""{' '.join(bias)} {short_author} {ref["Title"]}""", num_results=1)
-        time.sleep(np.random.randint(15,20))
+        short_author = f"""{clean_string(ref["Author"], min_word_length = 2)}""".split()
+        short_author = short_author[0:np.min([len(short_author), 3])]
+        url = search_with_backoff(f"""{' '.join(bias)} {short_author} {ref["Title"]}""", num_results=1, serp_key = serp_key)
+        if not serp_key:
+            time.sleep(np.random.randint(10,20))
         if url:
             ref["Abstract Note"] = extract_abstract(url, title = clean_string(ref["Title"]), authors = clean_string(ref["Author"], min_word_length=2))
             if len(ref["Abstract Note"]) > 20:
@@ -1093,8 +1100,7 @@ def references_string_as_list(input_string: str) -> list:
     used to convert gpt response to python list
     """
     if not ("[" in input_string and "]" in input_string):
-        print("no brackets found in extracted references")
-        return []
+        return [] #skip malformatted refs of current section
     first_bracket_index = input_string.find('[')
     last_bracket_index = input_string.rfind(']')
     result_string = input_string[first_bracket_index:1+last_bracket_index]
@@ -1159,7 +1165,7 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
 
     Args:
         pdffile (str): The path to the input PDF file to be reviewed. should include a reference list.
-        addonfile (str, optional): Additional pdf to guide literature search. pdf file (eg. recent paper or lit review) should include a relevant reference list.
+        addonfile (str): Additional pdf to guide literature search. pdf file (eg. recent paper or lit review) should include a relevant reference list.
         lit_csv (str, optional): If a zotero style literature corpus already exists as a CSV file, then this path can be used to skip literature search. Also skips addonfile.
         Note that this file needs to have the columns "Author", "Title", "Abstract Note", and "Publication Year"
         vectorstore (str, optional): If you have previously generated a Chroma vectorstore, add the path to the folder. Otherwise, this folder will be generated.
@@ -1190,7 +1196,13 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
     ###tests
     if not "OPENAI_API_KEY" in os.environ:
         raise ValueError("could not find OPENAI_API_KEY in your path/environment variables")
-        openai.api_key = os.environ['OPENAI_API_KEY']
+    openai.api_key = os.environ['OPENAI_API_KEY']
+    if not "SERP_API_KEY" in os.environ:
+        print("could not find SERP_API_KEY in your path/environment variables. get one at valueserp.com")
+        print("proceeding without serp api key / might hit google rate limit")
+        serp_key = None
+    else:
+        serp_key = os.environ['SERP_API_KEY']
     test_response = openai.ChatCompletion.create( #API TEST - GPT4
         model=openai_model,
         messages=[{"role": "system", "content": "You say Test"}, {"role": "user", "content": "Say Test"}], 
@@ -1199,20 +1211,23 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
     chrome_options.add_argument("--headless=new")
     driver = webdriver.Chrome(options=chrome_options)
     driver.quit()
+    addedlittest = PyPDF2.PdfReader(addonfile)
+    del addedlittest
+    del test_response
+    del chrome_options
     ###end tests
 
     if not vectorstore:
         if not lit_csv:
             lit_csv = f"""{pdffile.lower().replace(".pdf", "")}_literature.csv"""
-            lit_df = generate_literature_csv_from_pdf(pdffile, openai_model, "Author", "Title", "Publication Year", max_secondary=max_secondary, output_path=lit_csv, lower=lower, upper=upper, left=left)
-            if addonfile:
-                added_lit_df = generate_literature_csv_from_pdf(addonfile, openai_model, "Author", "Title", "Publication Year", max_secondary=max_secondary, output_path=None, include_source_as_ref=True)
-                combined_df = pd.concat([added_lit_df, lit_df], ignore_index=True)
-                lit_df = remove_duplicate_rows(combined_df).reset_index(drop=True)
+            lit_df = generate_literature_csv_from_pdf(pdffile, openai_model, "Author", "Title", "Publication Year", max_secondary=max_secondary, output_path=lit_csv, lower=lower, upper=upper, left=left, serp_key = serp_key)
+            added_lit_df = generate_literature_csv_from_pdf(addonfile, openai_model, "Author", "Title", "Publication Year", max_secondary=max_secondary, output_path=None, include_source_as_ref=True, serp_key = serp_key)
+            combined_df = pd.concat([added_lit_df, lit_df], ignore_index=True)
+            lit_df = remove_duplicate_rows(combined_df).reset_index(drop=True)
         else:
             print("---using pre-existing literature file. reformatting and generating vectorstore")
         if autosearch:
-            lit_df = autosearch_missing_abstracts(lit_csv, lit_csv)
+            lit_df = autosearch_missing_abstracts(lit_csv, lit_csv, serp_key = serp_key)
         else:
             print("skipping autosearch for missing abstracts")
         if manual_abstracts:
@@ -1245,25 +1260,43 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
     return None
 
 
-def search_with_backoff(query, num_results=1, max_retries=5, retry_delay_base=15):
+def search_with_backoff(query, num_results=1, max_retries=2, retry_delay_base=15, serp_key = None):
     """
     search google via googlesearch package. use exponential backoff in case of rate limit
     """
-    for retry_count in range(max_retries):
-        try:
-            results = search(query, num_results)
-            if num_results == 1:
-                return list(results)[0]
-            else:
-                return list(results)
-        except Exception as e:
-            print(f"Attempt {retry_count + 1} failed: {e}")
-            retry_delay = retry_delay_base * 2 ** retry_count
-            retry_delay += np.random.randint(1, 6)  # Random value between 1 and 5
-            print(f"Retrying in {retry_delay} seconds...")
-            time.sleep(retry_delay)
-    print("Max retries reached, operation failed.")
-    return None  # Return None to indicate failure
+    print(f"serping with query : {query}")
+    if serp_key:
+        params = {
+        'api_key': serp_key,
+        'q': query}
+        api_result = requests.get('https://api.valueserp.com/search', params).json()
+        print(api_result["request_info"]["success"])
+        if "organic_results" in api_result:
+            len_results = len(api_result["organic_results"])
+        else:
+            return None
+        nr_links = np.min([len_results, num_results])
+        urls = [res["link"] for res in api_result["organic_results"][0:nr_links]]
+        if num_results == 1:
+            return urls[0]
+        else:
+            return urls
+    else:
+        for retry_count in range(max_retries):
+            try:
+                urls = search(query, num_results)
+                if num_results == 1:
+                    return list(urls)[0]
+                else:
+                    return list(urls)
+            except Exception as e:
+                print(f"Attempt {retry_count + 1} failed: {e}")
+                retry_delay = retry_delay_base * 2 ** retry_count
+                retry_delay += np.random.randint(1, 6)  # Random value between 1 and 5
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+        print("Max retries reached, operation failed.")
+        return None  # Return None to indicate failure
 
 
 def shorten(text: str, length: int) -> str:
@@ -1329,5 +1362,5 @@ def trim_pdf(article_file: str, lower: int, upper: int, left: int, verbose: bool
     if len(trimmed_parts) > 0:
         print(f"""With your current settings for upper, lower, and left there were things trimmed from the pdf (try trim_pdf() to finetune pdf cropping). Snippet: [{shorten(",  ".join(trimmed_parts), 800)}]\n\n""")
     else:
-        print("TIP: you can use the arguments upper (~763), lower (~70), and left (~10) to trim away headers, footers, or line numbers from pdf. set verbose to True to see what was cut.")
+        print("TIP: The arguments upper (~763), lower (~70), and left (~10) can trim away headers, footers, or line numbers from pdf. \nPlay with trim_pdf('my_file.pdf', upper, lower, left, verbose) to test it out.")
     return "".join(parts)
