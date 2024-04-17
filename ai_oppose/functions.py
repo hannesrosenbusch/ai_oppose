@@ -30,10 +30,132 @@ import PyPDF2
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import Table
+from reportlab.lib import colors
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+
+
+def merge_responses_by_reference(dictionaries: dict):
+    """
+    This function creates a dictionary that merges all the comments made by the AI model based on each reference (internal usage)
+    input is a dictionary
+    """
+
+    # Initialize an empty dictionary to store merged responses and counts
+    merged_responses = {}
+    
+    # Initialize an empty dictionary to store counts and indices
+    index_dict = {}
+    
+    # Iterate over each dictionary in the list
+    for dictionary_index, dictionary in enumerate(dictionaries):
+        # Extract references and responses from the current dictionary
+        references = dictionary.get('references', [])
+        responses = dictionary.get('responses', [])
+        
+        # Iterate over each reference in the list of references
+        for reference_index, reference in enumerate(references):
+            # If the reference is already in the dictionary, update its count and append the index
+            if reference in index_dict:
+                index_dict[reference]["count"] += 1
+                index_dict[reference]["indices"].append((dictionary_index, reference_index))
+            # If the reference is encountered for the first time, initialize its count and indices
+            else:
+                index_dict[reference] = {"count": 1, "indices": [(dictionary_index, reference_index)]}
+    
+    # Sort the dictionary by count in descending order
+    sorted_index_dict = dict(sorted(index_dict.items(), key=lambda item: item[1]["count"], reverse=True))
+    
+    # Iterate over each reference and its info in the sorted dictionary
+    for reference, info in sorted_index_dict.items():
+        # Initialize an empty list to store merged responses
+        merged_response_list = []
+        
+        # Iterate over each index tuple (dictionary_index, reference_index) in the indices list
+        for dictionary_index, reference_index in info['indices']:
+            # Get the responses corresponding to the current index tuple
+            responses = dictionaries[dictionary_index]['responses']
+            
+            # Append the response to the merged_response_list
+            merged_response_list.append(responses[reference_index])
+        
+        # Join the merged_response_list into a single string
+        merged_response = '\n'.join(merged_response_list)
+        
+        # Store merged responses and count in the merged_responses dictionary
+        merged_responses[reference] = {"responses": merged_response, "count": info["count"]}
+    
+    # Return the merged_responses dictionary
+    return merged_responses
+
+
+def summarize_responses(dictionaries: dict, openai_model: str):
+    """
+    This function first calls the merge_responses_by_reference to merge all AI comments for a specific reference and then uses chat completion to summarize them (internal usage)
+    """
+    openai.api_key = os.environ['OPENAI_API_KEY']
+
+    # Initialize an empty dictionary to store summaries
+    summaries = {}
+
+    # Call merge_responses_by_reference to merge AI comments based on the same reference
+    merged_responses = merge_responses_by_reference(dictionaries)
+
+    # Iterate over each reference and data in the merged_responses dictionary
+    for reference, data in merged_responses.items():
+        # Extract responses and count from the data
+        responses = data["responses"]
+        count = data["count"]
+        
+        # Use the OpenAI API to summarize the responses
+        prompt = "Summarize the following criticisms of a scientific article into a coherent text.  Keep it concise:\n" + "\n".join(responses)
+        system_prompt = "Remember to provide a concise summary that captures the main criticisms of the scientific article. Focus on clarity and coherence."
+        response_summary = perform_chat_completion(prompt=prompt, system_message=system_prompt, temperature=0, openai_model = openai_model)
+        
+        # Store the summary and count in the summaries dictionary
+        summaries[reference] = {
+            "summary": response_summary,
+            "count": count
+        }
+    
+    # Return the summaries dictionary
+    return summaries
+
+
+def keywords_string_as_dict(input_string: str) -> dict:
+    """
+    converts string to dictionary if possible via eval()
+    used to convert gpt response to python dict
+    """
+    
+    if not ("{" in input_string and "}" in input_string):
+        return {} #skip malformatted refs of current section
+    first_bracket_index = input_string.find('{')
+    last_bracket_index = input_string.rfind('}')
+    result_string = input_string[first_bracket_index:1+last_bracket_index]
+    try:
+        evaluated_dict = dict(eval(result_string))
+        return evaluated_dict
+    except:
+        print(f"Error: Could not evaluate the string as a dict: {input_string} trimmed: {result_string}.")
+        return {}
+
+
+def summarize_keywords_with_indices(dictionaries: dict):
+    summary = {}
+    for idx, item in enumerate(dictionaries, start=1):
+        keywords = item['keywords']
+        for key, value in keywords.items():
+            if key not in summary:
+                summary[key] = {'Mentioned': value, 'Section': []}
+            else:
+                summary[key]['Mentioned'] = summary[key]['Mentioned'] or value
+            if value:
+                summary[key]['Section'].append(idx)
+    return summary
 
 
 def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500, max_paragraphs = 5, lower = 0, upper = 10000, left = 0, verbose = False) -> list:
@@ -78,9 +200,14 @@ def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500,
         prompt3 = f"Classify whether the following text includes a scientific claim <<<{response2}>>>. Only answer 'yes' or 'no'"
         system_prompt3 = "You are an AI model that decides whether a text is a scientific claim. You only say 'yes' or 'no'"
         response3 = perform_chat_completion(prompt=prompt3, system_message=system_prompt3, temperature=0, openai_model = openai_model)
+        #keywords mentioned
+        prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (Power analysis, Ethics approval, Author contribution, Data collection method or sampling plan). Respond in this format: {{'Power analysis': False, 'Ethics approval': True, 'Author contribution': False, 'Data collection method or sampling plan': False}}. Paper snippet: <<<{doc.page_content}>>>"
+        system_prompt5 = "You are an AI model that determines whether certain concepts are discussed in text. You only answer in the specified format."
+        response5 = perform_chat_completion(prompt=prompt5, system_message=system_prompt5, temperature=0, openai_model = openai_model)
+        keyword_dict = keywords_string_as_dict(response5)
         if "no" in response3.lower():
             response2 = "''"
-        section = {"page_content": doc.page_content, "summary": response1, "claim": response2, "reviewable": True}
+        section = {"page_content": doc.page_content, "summary": response1, "claim": response2, "keywords": keyword_dict, "reviewable": True}
         sections.append(section)
     return sections
 
@@ -129,7 +256,7 @@ def autosearch_missing_abstracts(file_path: str, outpath: str, serp_key: str) ->
     return sort_according_to_abstract_len(df)
 
 
-def create_pdf_from_dicts(sections, output_file):
+def create_pdf_from_dicts(sections, summaries, summarized_keywords, output_file):
     print(f"\n---creating {output_file}")
     doc = SimpleDocTemplate(output_file, pagesize=letter)
     styles = getSampleStyleSheet()
@@ -170,6 +297,43 @@ def create_pdf_from_dicts(sections, output_file):
     current_date = datetime.now().strftime("%B %d, %Y")
     date_location = Paragraph(f"{current_date}<br/>", styles["Normal"])
     story.append(date_location)
+    story.append(Spacer(1, 50)) 
+    heading2 = Paragraph("Keywords table\n", heading_style)
+    story.append(heading2)
+    story.append(Spacer(1, 20))
+
+    # Prepare data for table
+    table_data = [['Keyword', 'Mentioned', 'Section']]
+    for keyword, info in summarized_keywords.items():
+        table_data.append([keyword, info['Mentioned'], ', '.join(map(str, info['Section']))])
+
+    # Create a Table object
+    t = Table(table_data)
+
+    # Customize table appearance
+    t.setStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.white),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ])
+
+    # Add table to story
+    story.append(t)
+
+    story.append(PageBreak())
+    heading3 = Paragraph("Refence-wise Review\n", heading_style)
+    story.append(heading3)
+    story.append(Spacer(1, 20))
+    for reference, item in summaries.items():
+        story.append(Paragraph("Reference:", bold_style))
+        story.append(Paragraph(reference, styles["Normal"]))
+        story.append(Paragraph("AI Comments:", bold_style))
+        story.append(Paragraph(item["summary"], styles["Normal"]))
+        story.append(Spacer(1, 20)) 
     story.append(PageBreak())
     for i, item in enumerate(sections, start=1):
         if not item["reviewable"]:
@@ -177,6 +341,7 @@ def create_pdf_from_dicts(sections, output_file):
         page_content = item.get("page_content", "")
         claim = item.get("claim", "")
         summary = item.get("summary", "")
+        keywords = item.get("keywords", "")
         opposition = item.get("opposition", "")
         refs = sorted(item.get("references", []))
         section_headline = f"SECTION {i}"
@@ -195,6 +360,8 @@ def create_pdf_from_dicts(sections, output_file):
         #     story.append(Paragraph(f"COMMENT {r}: {response}", normal_style_ind))
         # story.append(Spacer(1, 10)) 
         story.append(Paragraph("References:", bold_style_ind))
+        story.append(Paragraph("Keywords table:", bold_style))
+        story.append(Paragraph(f"{keywords}", styles["Normal"]))
         for ref in refs:
             story.append(Spacer(1, 4)) 
             story.append(Paragraph(f"- {ref}", italic_style_ind))
@@ -1256,7 +1423,9 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
             sections[i]["opposition"] = "AI deemed section not reviewable."
             sections[i]["responses"] = []
             sections[i]["references"] = []
-    create_pdf_from_dicts(sections, f"""{pdffile.lower().replace(".pdf", "")}_review.pdf""")
+    summaries = summarize_responses(sections, openai_model=openai_model)
+    summarized_keywords = summarize_keywords_with_indices(sections)
+    create_pdf_from_dicts(sections, summaries, summarized_keywords, f"""{pdffile.lower().replace(".pdf", "")}_review.pdf""")
     return None
 
 

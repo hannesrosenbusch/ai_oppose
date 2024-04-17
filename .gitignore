@@ -5,3 +5,8 @@ trash
 *.bak
 *.dat
 *.dir
+*.docx
+trash.csv
+*.pkl
+*vectorstore*
+__pycache__/

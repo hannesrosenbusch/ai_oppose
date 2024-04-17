@@ -1,5 +1,5 @@
 Metadata-Version: 2.1
-Name: ai-oppose
+Name: ai_oppose
 Version: 0.0.15
 Summary: generating adversarial takes on science claims with openai plus vectorstores
 Home-page: https://github.com/hannesrosenbusch/ai_oppose
