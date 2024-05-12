@@ -111,8 +111,8 @@ def summarize_responses(dictionaries: dict, openai_model: str):
         count = data["count"]
         
         # Use the OpenAI API to summarize the responses
-        prompt = "Summarize the following criticisms of a scientific article into a coherent text.  Keep it concise:\n" + "\n".join(responses)
-        system_prompt = "Remember to provide a concise summary that captures the main criticisms of the scientific article. Focus on clarity and coherence."
+        prompt = f"Summarize the following criticisms of a scientific manuscript into a coherent text. Refer to the original scientific manuscript as 'your manuscript' and keep the summary concise: {responses}"
+        system_prompt = "Remember to provide a concise summary that captures the main criticisms of the scientific manuscript. Focus on clarity and coherence."
         response_summary = perform_chat_completion(prompt=prompt, system_message=system_prompt, temperature=0, openai_model = openai_model)
         
         # Store the summary and count in the summaries dictionary
@@ -158,7 +158,7 @@ def summarize_keywords_with_indices(dictionaries: dict):
     return summary
 
 
-def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500, max_paragraphs = 5, lower = 0, upper = 10000, left = 0, verbose = False) -> list:
+def analyze_paragraphs(pdffile: str, openai_model: str, extra_keywords = None, paragraph_length = 1500, max_paragraphs = 5, lower = 0, upper = 10000, left = 0, verbose = False) -> list:
     """
     Function that takes text from pdffile and splits it in sections.
     It loops through sections and checks whether the text is suitable for a scientific review.
@@ -201,7 +201,10 @@ def analyze_paragraphs(pdffile: str, openai_model: str, paragraph_length = 1500,
         system_prompt3 = "You are an AI model that decides whether a text is a scientific claim. You only say 'yes' or 'no'"
         response3 = perform_chat_completion(prompt=prompt3, system_message=system_prompt3, temperature=0, openai_model = openai_model)
         #keywords mentioned
-        prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (Power analysis, Ethics approval, Author contribution, Data collection method or sampling plan). Respond in this format: {{'Power analysis': False, 'Ethics approval': True, 'Author contribution': False, 'Data collection method or sampling plan': False}}. Paper snippet: <<<{doc.page_content}>>>"
+        if extra_keywords is not None and len(extra_keywords) > 0:
+            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan, {', '.join(extra_keywords).lower()}). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
+        else:
+            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
         system_prompt5 = "You are an AI model that determines whether certain concepts are discussed in text. You only answer in the specified format."
         response5 = perform_chat_completion(prompt=prompt5, system_message=system_prompt5, temperature=0, openai_model = openai_model)
         keyword_dict = keywords_string_as_dict(response5)
@@ -298,7 +301,7 @@ def create_pdf_from_dicts(sections, summaries, summarized_keywords, output_file)
     date_location = Paragraph(f"{current_date}<br/>", styles["Normal"])
     story.append(date_location)
     story.append(Spacer(1, 50)) 
-    heading2 = Paragraph("Keywords table\n", heading_style)
+    heading2 = Paragraph("Key Concepts Table\n", heading_style)
     story.append(heading2)
     story.append(Spacer(1, 20))
 
@@ -341,7 +344,7 @@ def create_pdf_from_dicts(sections, summaries, summarized_keywords, output_file)
         page_content = item.get("page_content", "")
         claim = item.get("claim", "")
         summary = item.get("summary", "")
-        keywords = item.get("keywords", "")
+        # keywords = item.get("keywords", "")
         opposition = item.get("opposition", "")
         refs = sorted(item.get("references", []))
         section_headline = f"SECTION {i}"
@@ -359,9 +362,9 @@ def create_pdf_from_dicts(sections, summaries, summarized_keywords, output_file)
         # for r, response in enumerate(responses):
         #     story.append(Paragraph(f"COMMENT {r}: {response}", normal_style_ind))
         # story.append(Spacer(1, 10)) 
+        # story.append(Paragraph("Keywords table:", bold_style))
+        # story.append(Paragraph(f"{keywords}", styles["Normal"]))
         story.append(Paragraph("References:", bold_style_ind))
-        story.append(Paragraph("Keywords table:", bold_style))
-        story.append(Paragraph(f"{keywords}", styles["Normal"]))
         for ref in refs:
             story.append(Spacer(1, 4)) 
             story.append(Paragraph(f"- {ref}", italic_style_ind))
@@ -1323,7 +1326,7 @@ def rename_dict_keys(input_dict: dict, key_mapping: dict) -> dict:
     return new_dict
 
 
-def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, max_paragraphs = 20, paragraph_length=1500, autosearch = True, manual_abstracts = True, upper = 2000, lower = 0, left = 0, openai_model = "gpt-4", max_secondary=50) -> None:
+def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, extra_keywords = None, max_paragraphs = 20, paragraph_length=1500, autosearch = True, manual_abstracts = True, upper = 2000, lower = 0, left = 0, openai_model = "gpt-4", max_secondary=50) -> None:
     """
     Use GPT4 to review your science article.
 
@@ -1337,6 +1340,7 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
         Note that this file needs to have the columns "Author", "Title", "Abstract Note", and "Publication Year"
         vectorstore (str, optional): If you have previously generated a Chroma vectorstore, add the path to the folder. Otherwise, this folder will be generated.
         If the vectorstore argument is provided, literature search and the lit_csv argument will be skipped.
+        extra_keywords(list of str, optional): a list of extra keywords to be searched for and captured in the Key Concepts table.
         max_paragraphs (int, optional): The maximum number of paragraphs from the pdffile to review.
         paragraph_length (int, optional): The maximum length (in characters) for each reviewed section in the pdffile.
         upper (int, optional): The number of lines to trim from the top of each page to remove headers. Don't guesstimate but play with trim_pdf() function to set value.
@@ -1406,7 +1410,7 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, m
 
     else:
         print("---using pre-existing vectorstore. skipping literature collection.")
-    sections = analyze_paragraphs(pdffile, openai_model=openai_model, paragraph_length=paragraph_length, max_paragraphs=max_paragraphs, lower = lower, upper = upper, left = left, verbose=False)
+    sections = analyze_paragraphs(pdffile, extra_keywords=extra_keywords, openai_model=openai_model, paragraph_length=paragraph_length, max_paragraphs=max_paragraphs, lower = lower, upper = upper, left = left, verbose=False)
     for i in range(len(sections)):
         if sections[i]["reviewable"]:
             relevant_docs =  get_relevant_docs(sections[i], openai_model=openai_model, chroma_directory=vectorstore)
