@@ -147,6 +147,9 @@ def keywords_string_as_dict(input_string: str) -> dict:
 def summarize_keywords_with_indices(dictionaries: dict):
     summary = {}
     for idx, item in enumerate(dictionaries, start=1):
+        if 'keywords' not in item:
+            continue
+    
         keywords = item['keywords']
         for key, value in keywords.items():
             if key not in summary:
@@ -202,9 +205,9 @@ def analyze_paragraphs(pdffile: str, openai_model: str, extra_keywords = None, p
         response3 = perform_chat_completion(prompt=prompt3, system_message=system_prompt3, temperature=0, openai_model = openai_model)
         #keywords mentioned
         if extra_keywords is not None and len(extra_keywords) > 0:
-            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan, {', '.join(extra_keywords).lower()}). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
+            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan, preregistration, data availability statement, conflict of interest, {', '.join(extra_keywords).lower()}). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
         else:
-            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
+            prompt5 = f"Classify whether the following concepts or similar concepts are discussed in the following paper snippet. If they are mentioned answer True, if they are absent answer False. These are the concepts, separated by commas: (power analysis, ethics approval, author contribution statement, data collection method or sampling plan, preregistration, data availability statement, conflict of interest). Respond in this format: {{'power analysis': False, 'ethics approval': True, ...}}. Paper snippet: <<<{doc.page_content}>>>"
         system_prompt5 = "You are an AI model that determines whether certain concepts are discussed in text. You only answer in the specified format."
         response5 = perform_chat_completion(prompt=prompt5, system_message=system_prompt5, temperature=0, openai_model = openai_model)
         keyword_dict = keywords_string_as_dict(response5)
@@ -1382,8 +1385,11 @@ def review(pdffile: str, addonfile = None, lit_csv = None, vectorstore = None, e
     chrome_options.add_argument("--headless=new")
     driver = webdriver.Chrome(options=chrome_options)
     driver.quit()
-    addedlittest = PyPDF2.PdfReader(addonfile)
-    del addedlittest
+    if not addonfile:
+        print("No addonfile with extra references provided")
+    else:
+        addedlittest = PyPDF2.PdfReader(addonfile)
+        del addedlittest
     del test_response
     del chrome_options
     ###end tests
